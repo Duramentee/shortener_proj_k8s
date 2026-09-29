@@ -1,0 +1,8 @@
+# 构建镜像时不需要进入构建上下文的文件与目录。
+# node_modules 由镜像内部的 npm install 重新生成，产物 dist/ 由镜像内部的 vite build 重新生成，
+# 把这两个目录排除可以显著减小构建上下文的大小，并且避免宿主机的二进制文件污染镜像。
+node_modules
+dist
+npm-debug.log*
+.DS_Store
+.vscode
