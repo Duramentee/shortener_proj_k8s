@@ -11,9 +11,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"shortener/internal/todo"
 )
 
 // ErrNotFound 表示查询的短码在数据库中不存在。
@@ -23,6 +23,13 @@ import (
 // 这两种情况在错误文本上可能都包含「no rows」之类的字样，因此不能靠文本判断，
 // 必须由存储层显式地返回一个可以用 errors.Is 判断的哨兵错误。
 var ErrNotFound = errors.New("短码不存在")
+
+// ErrConflict 表示插入的短码与已有记录冲突，也就是 links 表的主键约束被违反。
+//
+// 它由 CreateLink 在数据库返回 SQLSTATE 23505 时返回，调用方据此决定是否重新生成短码再试一次。
+// 与 ErrNotFound 一样，它是一个可以用 errors.Is 判断的哨兵错误；
+// 数据库返回的原始 *pgconn.PgError 依然保留在同一条错误链中，因此也可以用 errors.As 取出。
+var ErrConflict = errors.New("主键冲突")
 
 // Link 是 links 表在 Go 侧对应的结构体。
 // 字段名与列名的对应关系见 README 第 3 节的数据模型。
@@ -125,8 +132,6 @@ func (p *Postgres) EnsureSchema(ctx context.Context) error {
 
 // CreateLink 向 links 表插入一条记录。
 //
-// TODO(第 2 组)：由你实现本函数。
-//
 // 实现要求：
 //  1. 只写入 code 与 url 两列。clicks 与 created_at 由建表语句中的默认值提供，
 //     也就是 0 与 now()，因此不要在插入语句里显式给它们赋值。
@@ -139,12 +144,28 @@ func (p *Postgres) EnsureSchema(ctx context.Context) error {
 //
 // 提示：使用 p.pool.Exec。
 func (p *Postgres) CreateLink(ctx context.Context, link Link) error {
-	return todo.Error("store.Postgres.CreateLink", 2)
+	const insertSQL = "INSERT INTO links (code, url) VALUES ($1, $2)"
+
+	if _, err := p.pool.Exec(ctx, insertSQL, link.Code, link.URL); err != nil {
+		// 包装的对象必须是原始的 err，而不是从它里面取出的 pgErr。
+		// 原因有两个：第一，err 之外可能还包着更外层的错误，直接返回 pgErr 会把那一层丢掉；
+		// 第二，%w 建立的错误链可以被 errors.As 逐层展开，
+		// 因此包装之后调用方依然能够取出内部的 *pgconn.PgError 并检查它的 Code 字段。
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			// 同一条语句中可以使用两个 %w（Go 1.20 起支持），返回的错误因此具有两条身份：
+			// 调用方可以用 errors.Is(err, ErrConflict) 判断「短码已被占用」，
+			// 也可以用 errors.As(err, &pgErr) 取出 SQLSTATE 做更细的判断。
+			return fmt.Errorf("%w：插入短码 %s 失败：%w", ErrConflict, link.Code, err)
+		}
+
+		return fmt.Errorf("插入短码 %s 失败：%w", link.Code, err)
+	}
+
+	return nil
 }
 
 // GetLink 按短码查询一条记录。
-//
-// TODO(第 2 组)：由你实现本函数。
 //
 // 实现要求：
 //  1. 查询 code、url、clicks、created_at 四列，并且按与 Link 结构体字段相同的顺序扫描。
@@ -155,12 +176,34 @@ func (p *Postgres) CreateLink(ctx context.Context, link Link) error {
 // 提示：使用 p.pool.QueryRow 与 Scan。
 func (p *Postgres) GetLink(ctx context.Context, code string) (Link, error) {
 	var link Link
-	return link, todo.Error("store.Postgres.GetLink", 2)
+
+	const selectSQL = "SELECT code, url, clicks, created_at FROM links WHERE code = $1"
+
+	// QueryRow 的签名中没有 error 返回值，因此语句执行阶段的错误与
+	// 「没有查到行」这两种情况都会延迟到调用 Scan 的时候才暴露出来。
+	// 语句中使用了 $1，因此第二个参数之后必须按顺序传入与占位符对应的取值。
+	row := p.pool.QueryRow(ctx, selectSQL, code)
+
+	// Scan 的目标必须是指针，数量必须等于结果集的列数，
+	// 顺序必须与 SELECT 中列出的顺序一致，也就是与 Link 结构体的字段顺序一致。
+	if err := row.Scan(&link.Code, &link.URL, &link.Clicks, &link.CreatedAt); err != nil {
+		// 出错时返回 Link{} 而不是 link。Scan 是逐列写入的，
+		// 如果某一列失败，位于它之前的列可能已经被写入 link，
+		// 直接返回 link 相当于把一个只填了一部分的记录交给调用方。
+		if errors.Is(err, pgx.ErrNoRows) {
+			// 只包装 ErrNotFound。短码不存在是可预期的结果而不是故障，
+			// 因此不需要把 pgx.ErrNoRows 也放进错误链中。
+			return Link{}, fmt.Errorf("短码 %s 不存在：%w", code, ErrNotFound)
+		}
+
+		// 其余错误按第 3 条要求原样向上传递，只在文本中补充本次使用的短码。
+		return Link{}, fmt.Errorf("查询短码 %s 失败：%w", code, err)
+	}
+
+	return link, nil
 }
 
 // ListLinks 按创建时间倒序分页查询记录。
-//
-// TODO(第 2 组)：由你实现本函数。
 //
 // 实现要求：
 //  1. 排序方式必须与索引 links_created_at_idx 的定义一致，也就是 created_at DESC。
@@ -174,23 +217,63 @@ func (p *Postgres) GetLink(ctx context.Context, code string) (Link, error) {
 // 提示：使用 p.pool.Query 取得 pgx.Rows，然后调用 rows.Next 与 rows.Scan 逐行读取，
 // 最后必须检查 rows.Err()，因为迭代过程中发生的错误只会通过它暴露出来。
 func (p *Postgres) ListLinks(ctx context.Context, limit int, offset int) ([]Link, error) {
-	return nil, todo.Error("store.Postgres.ListLinks", 2)
+	// 用 make 建立长度为 0、容量为 limit 的切片，而不是用 var 声明。
+	// var 声明出来的是 nil 切片，它序列化之后会变成 null，
+	// 而接口契约规定 items 字段始终是数组。
+	links := make([]Link, 0, limit)
+
+	const selectSQL = "SELECT code, url, clicks, created_at FROM links ORDER BY created_at DESC, code DESC LIMIT $1 OFFSET $2"
+
+	rows, err := p.pool.Query(ctx, selectSQL, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("查询列表失败：%w", err)
+	}
+
+	// 连接在结果集关闭之后才归还给连接池，因此这一步不能省略。
+	defer rows.Close()
+
+	// Next 同时承担「推进游标」与「报告还有没有下一行」两件事，
+	// 因此它直接写在 for 的条件位置，循环体内部不需要再判断。
+	for rows.Next() {
+		var link Link
+
+		// 与 GetLink 一致：目标是字段的地址，数量与顺序必须与 SELECT 中列出的列一致。
+		if err := rows.Scan(&link.Code, &link.URL, &link.Clicks, &link.CreatedAt); err != nil {
+			return nil, fmt.Errorf("读取列表记录失败：%w", err)
+		}
+
+		links = append(links, link)
+	}
+
+	// Next 返回 false 有两种可能：全部行已经读完，或者中途发生了错误。
+	// 区分这两者只能依靠 Err()，并且它必须在结果集关闭之后调用。
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历列表记录失败：%w", err)
+	}
+
+	return links, nil
 }
 
 // CountLinks 返回 links 表中的记录总数，供统计接口使用。
-//
-// TODO(第 2 组)：由你实现本函数。
 //
 // 实现要求：使用 count(*) 聚合函数，并且把结果扫描到 int64 变量中。
 //
 // 提示：使用 p.pool.QueryRow 与 Scan。
 func (p *Postgres) CountLinks(ctx context.Context) (int64, error) {
-	return 0, todo.Error("store.Postgres.CountLinks", 2)
+	var cnt int64
+
+	const countSQL = "SELECT count(*) FROM links"
+
+	row := p.pool.QueryRow(ctx, countSQL)
+
+	if err := row.Scan(&cnt); err != nil {
+		return 0, fmt.Errorf("查询记录总数失败：%w", err)
+	}
+
+	return cnt, nil
 }
 
 // SumClicks 返回 links 表中 clicks 列的总和，供统计接口使用。
-//
-// TODO(第 2 组)：由你实现本函数。
 //
 // 实现要求：使用 coalesce(sum(clicks), 0) 而不是 sum(clicks)。
 // 原因是表中没有任何记录时 sum(clicks) 的结果是 NULL，
@@ -198,13 +281,21 @@ func (p *Postgres) CountLinks(ctx context.Context) (int64, error) {
 //
 // 提示：使用 p.pool.QueryRow 与 Scan。
 func (p *Postgres) SumClicks(ctx context.Context) (int64, error) {
-	return 0, todo.Error("store.Postgres.SumClicks", 2)
+	var total int64
+
+	const sumClicksSQL = "SELECT coalesce(sum(clicks), 0) FROM links"
+
+	row := p.pool.QueryRow(ctx, sumClicksSQL)
+
+	if err := row.Scan(&total); err != nil {
+		return 0, fmt.Errorf("查询点击总数失败：%w", err)
+	}
+
+	return total, nil
 }
 
 // AddClicks 把指定的增量累加到某条记录的 clicks 列上。
 // 本函数由后台写回协程调用，请求处理路径不会调用它。
-//
-// TODO(第 2 组)：由你实现本函数。
 //
 // 实现要求：
 //  1. 使用 UPDATE links SET clicks = clicks + $2 WHERE code = $1 这种形式，
@@ -216,16 +307,40 @@ func (p *Postgres) SumClicks(ctx context.Context) (int64, error) {
 //
 // 提示：使用 p.pool.Exec，并且通过返回的 CommandTag 的 RowsAffected 方法判断是否命中了记录。
 func (p *Postgres) AddClicks(ctx context.Context, code string, delta int64) error {
-	return todo.Error("store.Postgres.AddClicks", 2)
+	const updateSQL = "UPDATE links SET clicks = clicks + $2 WHERE code = $1"
+
+	tag, err := p.pool.Exec(ctx, updateSQL, code, delta)
+	if err != nil {
+		return fmt.Errorf("累加短码 %s 的点击次数失败：%w", code, err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("短码 %s 不存在：%w", code, ErrNotFound)
+	}
+
+	return nil
 }
 
 // DeleteLink 按短码删除一条记录。
-//
-// TODO(第 2 组)：由你实现本函数。
 //
 // 实现要求：记录不存在时返回 ErrNotFound，供调用方决定是否返回 404。
 //
 // 提示：使用 p.pool.Exec 与 CommandTag 的 RowsAffected 方法。
 func (p *Postgres) DeleteLink(ctx context.Context, code string) error {
-	return todo.Error("store.Postgres.DeleteLink", 2)
+	const deleteSQL = "DELETE FROM links WHERE code = $1"
+
+	// DELETE 与 UPDATE 在「没有命中任何记录」时不会返回错误，
+	// 只返回一个影响行数为 0 的命令标签。因此「记录不存在」这个分支
+	// 只能通过 CommandTag 的 RowsAffected 方法判断，不能依靠 err。
+	tag, err := p.pool.Exec(ctx, deleteSQL, code)
+	if err != nil {
+		return fmt.Errorf("删除短码 %s 失败：%w", code, err)
+	}
+
+	// 影响行数为 0 才说明没有记录被删除。
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("短码 %s 不存在：%w", code, ErrNotFound)
+	}
+
+	return nil
 }
