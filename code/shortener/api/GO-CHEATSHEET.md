@@ -23,7 +23,7 @@
 | 未使用的导入 | 会导致编译失败 | 实现 `handleListLinks` 时如果没有用到 `strconv`，就必须删除这一行导入 | 这是刻意的设计，用来防止依赖无限增长 |
 | 未使用的局部变量 | 会导致编译失败 | — | 但未使用的函数参数不会报错 |
 | `internal` 目录 | 位于 `internal/` 下面的包只能被本模块内部的代码导入 | `internal/store` 无法被 `shortener` 之外的模块导入 | 由编译器强制，用来表达「这些包属于实现细节」 |
-| 包注释 | 写在 `package` 关键字上方的连续注释 | `internal/todo/todo.go` 开头以 `Package todo` 起始的注释块 | 约定格式是 `Package 包名 说明文字`，`go doc` 与编辑器提示都会显示它 |
+| 包注释 | 写在 `package` 关键字上方的连续注释 | `internal/shortcode/shortcode.go` 开头以 `Package shortcode` 起始的注释块 | 约定格式是 `Package 包名 说明文字`，`go doc` 与编辑器提示都会显示它 |
 
 ---
 
@@ -110,7 +110,7 @@ Go 只有 `for` 一个循环关键字，没有 `while`，也没有 `do...while`�
 | 不能使用字符串比较 | 不要写 `err.Error() == "..."` | — | 错误文本会随包装层与版本变化，包装之后再也匹配不上 |
 | 判断错误是否来自上游库 | `errors.Is(err, pgx.ErrNoRows)`、`errors.Is(err, redis.Nil)` | 第 2 组的 `GetLink` 与第 3 组的 `GetURL` | 第三方库也使用哨兵错误表达「没有数据」这种正常情况 |
 | 忽略明确的无关错误 | 用空标识符显式丢弃 | `_ = pg.DeleteLink(ctx, code)` 出现在测试的清理逻辑中 | 写成 `_ =` 而不是完全不接返回值，是为了让读代码的人知道这个忽略是刻意的 |
-| 自定义错误的实现 | 只要类型拥有 `Error() string` 方法就满足 `error` 接口 | `internal/todo` 包借助 `errors.New` 生成错误 | 本工程没有自定义错误类型，全部使用 `errors.New` 与 `fmt.Errorf` |
+| 自定义错误的实现 | 只要类型拥有 `Error() string` 方法就满足 `error` 接口 | `internal/store` 包借助 `errors.New` 生成 `ErrNotFound` 与 `ErrConflict` 两个哨兵错误 | 本工程没有自定义错误类型，全部使用 `errors.New` 与 `fmt.Errorf` |
 
 为什么 `store` 必须区分「记录不存在」与「数据库出错」，并且用两个不同的返回值表达：
 前者是正常的业务结果，处理函数应当返回 404；后者是系统故障，处理函数应当返回 503。

@@ -9,6 +9,14 @@ FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 
+# GOPROXY 通过构建参数传入，默认取值指向国内镜像。
+# 需要这一步的原因是 proxy.golang.org 在这台机器上不可达，
+# 镜像构建阶段执行 go mod download 时会直接失败。
+# 需要换回官方代理时，可以执行
+# docker build --build-arg GOPROXY=https://proxy.golang.org,direct 。
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
+
 # 先只复制依赖清单再下载依赖。只要这两个文件没有变化，
 # 这一层就会被构建缓存命中，修改源码时不需要重新下载依赖。
 COPY go.mod go.sum* ./

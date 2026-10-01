@@ -11,11 +11,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
-
-	"shortener/internal/todo"
 )
 
 // ErrMiss 表示缓存中没有对应的键，也就是缓存未命中。
@@ -62,6 +62,20 @@ func New(ctx context.Context, addr string, password string, db int) (*Redis, err
 		Addr:     addr,
 		Password: password,
 		DB:       db,
+
+		// 下面四项把客户端的超时边界固定下来，目的是让就绪探针在确定的时间之内得到结论。
+		//
+		// ContextTimeoutEnabled 的默认取值是 false，此时客户端会把调用方传入的 context
+		// 替换成 context.Background()，调用方设置的时限被完全丢弃；
+		// 建立连接改为使用 DialTimeout，而 DialTimeout 的默认取值是 5 秒。
+		// 实测现象：Redis 容器正在停止的过程中，Docker 的端口代理仍然会接受 TCP 连接，
+		// 此时就绪检查要等待 5 秒才有结论，超过 TASKS.md 第 7 组验收要求的 3 秒。
+		// 把这一项设置为 true 之后，调用方的 context 时限会一路传到连接建立与读写，
+		// 就绪检查使用的 2 秒时限因此能够真正生效。
+		ContextTimeoutEnabled: true,
+		DialTimeout:           2 * time.Second,
+		ReadTimeout:           2 * time.Second,
+		WriteTimeout:          2 * time.Second,
 	})
 
 	if err := client.Ping(ctx).Err(); err != nil {
@@ -89,23 +103,28 @@ func (r *Redis) Ping(ctx context.Context) error {
 
 // GetURL 查询短链接缓存。
 //
-// TODO(第 3 组)：由你实现本函数。
-//
 // 实现要求：
 //  1. 键名使用 LinkKey(code)。
 //  2. 键不存在时必须返回 ErrMiss，判断方式是 errors.Is(err, redis.Nil)。
 //     redis.Nil 是客户端库用来表示「键不存在」的哨兵错误，它不是一个真正的故障。
-//  3. 其余错误原样返回。调用方需要区分「未命中」与「Redis 不可用」这两种情况，
+//  3. 其余错误包装之后向上返回。调用方需要区分「未命中」与「Redis 不可用」这两种情况，
 //     前者要回落到数据库查询，后者要把请求判定为失败。
 //
 // 提示：使用 r.client.Get，并且读取返回的 *redis.StringCmd 的 Result 方法。
 func (r *Redis) GetURL(ctx context.Context, code string) (string, error) {
-	return "", todo.Error("cache.Redis.GetURL", 3)
+	url, err := r.client.Get(ctx, LinkKey(code)).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return "", ErrMiss
+		}
+
+		return "", fmt.Errorf("读取短码 %s 的缓存失败：%w", code, err)
+	}
+
+	return url, nil
 }
 
 // SetURL 写入短链接缓存，并设置生存时间。
-//
-// TODO(第 3 组)：由你实现本函数。
 //
 // 实现要求：
 //  1. 键名使用 LinkKey(code)，生存时间使用参数 ttl。
@@ -114,12 +133,14 @@ func (r *Redis) GetURL(ctx context.Context, code string) (string, error) {
 //
 // 提示：使用 r.client.Set，它的第三个参数就是生存时间。
 func (r *Redis) SetURL(ctx context.Context, code string, url string, ttl time.Duration) error {
-	return todo.Error("cache.Redis.SetURL", 3)
+	if err := r.client.Set(ctx, LinkKey(code), url, ttl).Err(); err != nil {
+		return fmt.Errorf("写入短码 %s 的缓存失败：%w", code, err)
+	}
+
+	return nil
 }
 
 // DeleteLink 删除某个短码对应的两个键：短链接缓存键与点击增量键。
-//
-// TODO(第 3 组)：由你实现本函数。
 //
 // 实现要求：
 //  1. 一次调用删除两个键，而不是分两次调用。减少往返次数可以缩短删除操作的耗时。
@@ -127,24 +148,28 @@ func (r *Redis) SetURL(ctx context.Context, code string, url string, ttl time.Du
 //
 // 提示：使用 r.client.Del，它接受可变数量的键名参数。
 func (r *Redis) DeleteLink(ctx context.Context, code string) error {
-	return todo.Error("cache.Redis.DeleteLink", 3)
+	if err := r.client.Del(ctx, LinkKey(code), ClicksKey(code)).Err(); err != nil {
+		return fmt.Errorf("删除短码 %s 的缓存键与增量键失败：%w", code, err)
+	}
+
+	return nil
 }
 
 // IncrClick 把某个短码的点击增量加一。
-//
-// TODO(第 3 组)：由你实现本函数。
 //
 // 实现要求：使用 Redis 的原子自增命令，不要先读取当前取值、在 Go 里加一、再写回去。
 // 后一种写法存在时间窗口：两个请求同时执行时，两次自增可能只留下一次的结果。
 //
 // 提示：使用 r.client.Incr。键不存在时该命令会把键的值视为 0 再加一，因此不需要先初始化。
 func (r *Redis) IncrClick(ctx context.Context, code string) error {
-	return todo.Error("cache.Redis.IncrClick", 3)
+	if err := r.client.Incr(ctx, ClicksKey(code)).Err(); err != nil {
+		return fmt.Errorf("累加短码 %s 的增量键失败：%w", code, err)
+	}
+
+	return nil
 }
 
 // RecordCacheResult 记录一次缓存查询的结果，供统计接口计算命中率。
-//
-// TODO(第 3 组)：由你实现本函数。
 //
 // 实现要求：命中时让 KeyCacheHits 自增，未命中时让 KeyCacheMisses 自增。
 // 两个统计键都不设置生存时间，因此在 Redis 重启（且没有开启持久化）之后会被清零，
@@ -152,12 +177,19 @@ func (r *Redis) IncrClick(ctx context.Context, code string) error {
 //
 // 提示：使用 r.client.Incr，命中时第一个参数取 KeyCacheHits，未命中时取 KeyCacheMisses。
 func (r *Redis) RecordCacheResult(ctx context.Context, hit bool) error {
-	return todo.Error("cache.Redis.RecordCacheResult", 3)
+	key := KeyCacheMisses
+	if hit {
+		key = KeyCacheHits
+	}
+
+	if err := r.client.Incr(ctx, key).Err(); err != nil {
+		return fmt.Errorf("累加统计键 %s 失败：%w", key, err)
+	}
+
+	return nil
 }
 
 // CacheStats 返回缓存命中与未命中的累计次数。
-//
-// TODO(第 3 组)：由你实现本函数。
 //
 // 实现要求：
 //  1. 一次调用读取两个键，而不是分两次调用。
@@ -169,13 +201,49 @@ func (r *Redis) RecordCacheResult(ctx context.Context, hit bool) error {
 // 不存在的键对应的元素是 nil，需要先判断类型再做整数转换；
 // 转换可以使用类型断言得到 string，再使用 strconv.ParseInt。
 func (r *Redis) CacheStats(ctx context.Context) (hits int64, misses int64, err error) {
-	return 0, 0, todo.Error("cache.Redis.CacheStats", 3)
+	values, err := r.client.MGet(ctx, KeyCacheHits, KeyCacheMisses).Result()
+	if err != nil {
+		return 0, 0, fmt.Errorf("读取统计键 %s 与 %s 失败：%w", KeyCacheHits, KeyCacheMisses, err)
+	}
+
+	hits, err = counterValue(values[0], KeyCacheHits)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	misses, err = counterValue(values[1], KeyCacheMisses)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return hits, misses, nil
+}
+
+// counterValue 把一个 MGET 返回的元素转换成 64 位整数。
+//
+// 参数 value 的静态类型是 any，因为 MGET 的返回值中每个位置既可能是字符串，也可能是 nil。
+// value 是 nil 表示对应的键在 Redis 中不存在，此时按 0 处理；
+// value 不是字符串，或者转换成整数失败时返回错误，避免把异常的取值当作 0 处理。
+func counterValue(value any, key string) (int64, error) {
+	if value == nil {
+		return 0, nil
+	}
+
+	text, ok := value.(string)
+	if !ok {
+		return 0, fmt.Errorf("键 %s 的取值类型是 %T，不是字符串", key, value)
+	}
+
+	parsed, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("键 %s 的取值 %q 不是合法的整数：%w", key, text, err)
+	}
+
+	return parsed, nil
 }
 
 // CollectClicks 读出全部尚未写回数据库的点击增量，返回「短码到增量」的映射。
 // 本函数由后台写回协程调用，请求处理路径不会调用它。
-//
-// TODO(第 3 组)：由你实现本函数。
 //
 // 实现要求：
 //  1. 不要使用 KEYS 命令枚举键。KEYS 会一次性遍历整个键空间并且阻塞其他命令的执行，
@@ -191,13 +259,46 @@ func (r *Redis) CacheStats(ctx context.Context) (hits int64, misses int64, err e
 // r.client.MGet 批量读取取值，或者逐个使用 r.client.Get。
 // 转换字符串到整数使用 strconv.ParseInt，第二个参数填写 10，第三个参数填写 64。
 func (r *Redis) CollectClicks(ctx context.Context) (map[string]int64, error) {
-	return nil, todo.Error("cache.Redis.CollectClicks", 3)
+	collected := make(map[string]int64)
+
+	cursor := uint64(0)
+	for {
+		keys, next, err := r.client.Scan(ctx, cursor, clicksKeyPrefix+"*", scanBatchSize).Result()
+		if err != nil {
+			return nil, fmt.Errorf("扫描点击增量键失败：%w", err)
+		}
+
+		if len(keys) > 0 {
+			values, err := r.client.MGet(ctx, keys...).Result()
+			if err != nil {
+				return nil, fmt.Errorf("读取点击增量键的取值失败：%w", err)
+			}
+
+			for index, key := range keys {
+				delta, err := counterValue(values[index], key)
+				if err != nil {
+					return nil, err
+				}
+
+				if delta == 0 {
+					continue
+				}
+
+				collected[strings.TrimPrefix(key, clicksKeyPrefix)] = delta
+			}
+		}
+
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+
+	return collected, nil
 }
 
 // SubtractClicks 从某个短码的点击增量中扣除已经写回数据库的部分。
 // 本函数由后台写回协程在数据库更新成功之后调用。
-//
-// TODO(第 3 组)：由你实现本函数。
 //
 // 实现要求：
 //  1. 使用减法命令而不是直接删除键，理由是：扣除之前键里可能已经累积了新的增量，
@@ -209,5 +310,9 @@ func (r *Redis) CollectClicks(ctx context.Context) (map[string]int64, error) {
 //
 // 提示：使用 r.client.DecrBy，第二个参数是要扣除的数量。
 func (r *Redis) SubtractClicks(ctx context.Context, code string, delta int64) error {
-	return todo.Error("cache.Redis.SubtractClicks", 3)
+	if err := r.client.DecrBy(ctx, ClicksKey(code), delta).Err(); err != nil {
+		return fmt.Errorf("扣除短码 %s 的点击增量失败：%w", code, err)
+	}
+
+	return nil
 }

@@ -17,7 +17,7 @@
 |---|---|---|
 | HTTP 框架（已选定） | HTTP 层使用 `github.com/gin-gonic/gin` v1.12.0。路由注册、路由分组、路径参数取值、JSON 响应写出、中间件链这五件事由框架承担 | 已经接入并且在 `go.mod` 中声明依赖，写法见 `GO-CHEATSHEET.md` 第 11 节与第 13 节 |
 | 基础设施（已写好） | 环境变量解析（`internal/config`）、PostgreSQL 连接池创建与建表（`internal/store`）、Redis 客户端创建与键名函数（`internal/cache`）、基于 gin 的路由注册与中间件挂载（`internal/httpapi/router.go`）、请求日志中间件与 panic 恢复中间件（`internal/httpapi/middleware.go`）、请求体解析与错误响应写出辅助函数（`internal/httpapi/handlers.go`）、`main` 的函数装配与优雅退出、`GET /api/healthz`、全部接口契约的响应结构体与转换函数 | 已写好，你不需要修改 |
-| 业务逻辑（由你实现） | 短码生成 1 个函数、存储层 7 个方法、缓存层 8 个方法、处理函数 6 个、后台写回 2 个方法，合计 24 个函数 | 待填写，每个函数的注释里写明了实现要求 |
+| 业务逻辑（由你实现） | 短码生成 1 个函数、存储层 7 个方法、缓存层 8 个方法、处理函数 6 个、后台写回 2 个方法，合计 24 个函数 | 已全部填写完成（第 4 组至第 8 组于 2026-09-30 完成），并且通过第 10 节的全量验收 |
 | 分层验证（已写好） | `internal/shortcode/shortcode_test.go`、`internal/store/postgres_test.go`、`internal/cache/redis_test.go`、`internal/httpapi/router_test.go` | 已写好，直接运行即可。前三个需要依赖服务或者环境变量，路由测试不需要任何依赖 |
 
 ### 0.2 未填写的函数在被调用时会怎样
@@ -51,6 +51,7 @@
 |---|---|---|
 | `BACKEND-OVERVIEW.md` | 六个包的职责边界与依赖方向、四条主路径的完整流转、接口契约与代码位置的对应关系、建议的代码阅读顺序 | 动手之前通读一遍；填写某个函数不确定它在系统里的位置时回查第 4 节 |
 | `GO-CHEATSHEET.md` | 本工程用到的全部 Go 语法与标准库功能，按包与导入、结构体与方法、错误处理、并发、测试等十六个主题编排，其中第 11 节讲 gin 的路由注册，第 13 节是 gin 与标准库 `net/http` 的逐项对照，第 14 节讲 `crypto/rand` 与 `math/big` 这两个包，第 15 节讲 pgx 与 PostgreSQL 的 SQL 语句与特性，第 16 节讲 Redis 与 go-redis | 写代码时遇到「这个写法是什么意思」或者「这个包怎么用」时按主题查阅 |
+| `GIN-WALKTHROUGH.md` | gin 处理一次请求的完整流转、一个可以直接运行的完整示例程序、按用途分组的 gin API 清单、四种响应写出方式的对照、本项目七个处理函数与 gin API 的对应关系、`handleCreateLink` 的调用序列、易错点清单与练习 | 第 4 组到第 7 组填写 HTTP 层代码之前通读一遍；忘记 `c.Param`、`c.DefaultQuery`、`c.Redirect`、`c.Status`、`c.Next`、`c.Abort` 这些方法的用法时按第 3 节的清单查阅 |
 
 ### 0.5 常用命令的快捷入口（Makefile）
 
@@ -558,3 +559,26 @@ PostgreSQL 与 Redis 完全一致。需要覆盖默认值时，先执行 `cp .en
 | 3 | 重新执行全量验收 | 执行第 10 节的全部命令，确认删除辅助包之后行为没有变化 |
 | 4 | 记录本阶段的结论 | 把第 2.4、3.4、4.4、5.4、6.4、7.3、9.3 七张小节的表格内容合并进当天笔记，作为第 3 周「存储与资源」主题的结论部分 |
 | 5 | 进入阶段 3 | 阶段 3 需要把四个组件一起放进 Compose 运行。`api/Dockerfile` 已经写好，你需要在 `compose.yaml` 中增加 `api` 与 `web` 两个服务，其中 `web` 的端口映射写成 `8080:80`，`api` 的服务名必须是 `api` 并且暴露 8080 端口，原因是 `web/nginx.conf` 中的上游地址写的正是 `api:8080` |
+
+---
+
+## 13. 本次完成的记录（2026-09-30）
+
+第 4 组至第 8 组与收尾动作已经全部执行完毕，下表记录实际执行的动作与实测结果，
+其中「实测结果」一列的内容来自本机运行的真实输出，可以直接作为笔记中的结论引用。
+
+| 序号 | 动作 | 实测结果 |
+|---|---|---|
+| 1 | 填写第 4 组至第 7 组的六个处理函数 | 代码位于 `internal/httpapi/handlers.go`，共用一个常量块（`maxURLLength`、`maxCreateAttempts`、`defaultListLimit`、`maxListLimit`、`readinessCheckTimeout`）与三个辅助函数（`isShortCodeFormat`、`checkDependency`、`cacheHitRate`） |
+| 2 | 填写第 8 组的两个方法 | `flusher.Run` 用 `time.NewTicker` 配合 `select` 同时等待定时器与 `ctx.Done()`，`FlushOnce` 逐个短码执行「先写数据库、后扣除缓存增量」 |
+| 3 | 删除 `internal/todo` 包 | 包内已经没有引用方，删除之后 `go build ./...` 与 `go vet ./...` 都没有输出，`gofmt -l .` 也为空 |
+| 4 | 更新 `internal/httpapi/router_test.go` | 期望取值同步为完成之后的行为；新增「请求体非法返回 400」「四个 `url` 校验分支」「五个分页校验分支」「短码格式不符返回 HTML 形态的 404」四组用例，`go test ./...` 全部通过 |
+| 5 | 修复就绪检查的超时上界 | 在 `internal/cache/redis.go` 的 `New` 中设置 `ContextTimeoutEnabled: true`、`DialTimeout`、`ReadTimeout`、`WriteTimeout` 四项。修复之前，Redis 容器正在停止的过程中，就绪检查要 5.005 秒才有结论；修复之后同一窗口下的最大值是 2.004 秒 |
+| 6 | 全量验收第 4 组至第 7 组 | 创建返回 201 且四个字段齐全；四个校验分支的文本与契约一致；跳转返回 302 与正确的 `Location`；`link:{code}` 的 `TTL` 是 300；删除返回 204 且两个键的 `EXISTS` 是 0；删除之后跳转返回 404；列表与统计的字段全部正确 |
+| 7 | 验收第 8 组 | 写回周期设置为 60 秒时，跳转十次之后 Redis 中的增量是 10 而数据库中的点击数仍然是 0；向进程发送 SIGTERM 触发优雅退出之后，数据库中的点击数变成 10，Redis 中的增量变成 0 |
+| 8 | 阶段 3 的 Compose 改造 | `compose.yaml` 增加 `api` 与 `web` 两个服务，`api` 不发布宿主机端口（与 Kubernetes 中只提供 ClusterIP 的安排一致），`web` 映射 `8080:80`；`api/Dockerfile` 增加 `GOPROXY` 构建参数，默认取值是 `https://goproxy.cn,direct` |
+
+需要写进笔记的机制共三条：第一，命中率的分母为 0 时必须返回 0，因为 `NaN` 不是合法的 JSON；
+第二，删除操作必须先动数据库再动缓存，反过来会让「数据库删除失败」表现为删除没有生效；
+第三，写回的扣除顺序决定了故障后果，先写数据库只会造成重复写回，先扣缓存会永久丢失计数。
+

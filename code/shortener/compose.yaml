@@ -58,6 +58,49 @@ services:
       retries: 10
     restart: unless-stopped
 
+  api:
+    # 构建上下文指向 api 目录，Dockerfile 就在该目录中。
+    build:
+      context: ./api
+    container_name: shortener-api
+    environment:
+      # 服务名 postgres 与 redis 由 Compose 的内置 DNS 解析成对应容器的地址，
+      # 因此这两个取值与在宿主机上运行时使用的 localhost 不同。
+      DATABASE_URL: postgres://shortener:shortener_dev_password@postgres:5432/shortener?sslmode=disable
+      REDIS_ADDR: redis:6379
+      # 容器中关闭 gin 的 debug 模式，避免每个请求都往标准输出写调试信息。
+      GIN_MODE: release
+    # 不在 ports 中发布 8080 端口，因此后端只在 Compose 网络内部可达，
+    # 外部流量只能经过 web 容器中的 nginx 进入，这与 Kubernetes 中后端只提供 ClusterIP 的安排一致。
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # 使用就绪检查端点作为健康检查，它同时验证 PostgreSQL 与 Redis 是否可用。
+      # 注意健康检查用的是容器内部的地址，不能写成宿主机的 localhost:8080。
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/api/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+    container_name: shortener-web
+    ports:
+      # 浏览器通过宿主机的 8080 端口访问前端页面，
+      # 前端再由 nginx 根据 upstream 中的 api:8080 把请求反向代理给后端。
+      - "8080:80"
+    depends_on:
+      api:
+        # 等后端通过健康检查之后再启动前端，避免启动阶段 nginx 解析不到上游主机名。
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   redis-data:

@@ -1,14 +1,19 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"shortener/internal/cache"
+	"shortener/internal/shortcode"
 	"shortener/internal/store"
-	"shortener/internal/todo"
 )
 
 // ---------------------------------------------------------------------------
@@ -123,7 +128,86 @@ func decodeJSON(c *gin.Context, dst any) error {
 }
 
 // ---------------------------------------------------------------------------
-// 处理函数。handleHealthz 已经写好，其余六个由你实现，任务分组编号写在各自上方。
+// 处理函数共用的常量与辅助函数。
+// ---------------------------------------------------------------------------
+
+const (
+	// maxURLLength 是 url 字段允许的最大长度，单位是字节。
+	// 契约中的表述是「长度超过 2048」，而 Go 的 len 作用于字符串时返回字节数，
+	// 因此含有中文的网址按每个汉字 3 个字节计算，与按字符计算的直觉不同。
+	maxURLLength = 2048
+	// maxCreateAttempts 是短码冲突时「生成短码并且插入」的最大尝试次数。
+	maxCreateAttempts = 5
+	// defaultListLimit 是列表接口在 limit 参数缺失时使用的取值。
+	defaultListLimit = 20
+	// maxListLimit 是列表接口允许的最大 limit 取值。
+	// 设置上限的目的是避免一次请求把整张表读出来：数据量增长之后，
+	// 这一次查询会占用大量内存与数据库时间，并且把全部结果压进一次响应。
+	maxListLimit = 100
+	// readinessCheckTimeout 是就绪检查访问每一个依赖的时限。
+	// 依赖处于「连接可以建立但是不响应」的状态时，没有时限的检查会一直等待，
+	// 直到调用方（kubelet）那一侧超时才有结果，因此必须自己给出一个明确的时限。
+	readinessCheckTimeout = 2 * time.Second
+)
+
+// redirectNotFoundHTML 是短码不存在时返回给浏览器的页面。
+// 跳转端点面向浏览器，因此这一种失败返回 HTML 而不是 JSON。
+const redirectNotFoundHTML = `<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>短码不存在</title></head>
+<body>
+<h1>短码不存在</h1>
+<p>你访问的短链接不存在，或者已经被删除。</p>
+</body>
+</html>
+`
+
+// isShortCodeFormat 判断取值是否符合短码格式：长度恰好等于 shortcode.Length，
+// 并且每一个字符都出现在 shortcode.Alphabet 中。
+//
+// 需要这一步校验的原因是路由模式 GET /:code 会匹配任意单个路径片段，
+// 直接访问后端端口时 /favicon.ico 与 /api 这样的路径也会命中跳转处理函数。
+func isShortCodeFormat(code string) bool {
+	if len(code) != shortcode.Length {
+		return false
+	}
+
+	// IndexByte 在字符不存在时返回 -1。短码只包含 ASCII 字符，
+	// 因此按字节逐个比较与按字符逐个比较得到的结论一致。
+	for index := 0; index < len(code); index++ {
+		if strings.IndexByte(shortcode.Alphabet, code[index]) < 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
+// checkDependency 在一个带时限的子 context 中执行一次依赖检查。
+// 检查成功时返回 nil，失败时返回具体的错误，由调用方决定如何写出。
+func checkDependency(parent context.Context, ping func(ctx context.Context) error) error {
+	ctx, cancel := context.WithTimeout(parent, readinessCheckTimeout)
+
+	// 无论检查是否成功都必须调用取消函数，否则子 context 占用的资源不会释放。
+	defer cancel()
+
+	return ping(ctx)
+}
+
+// cacheHitRate 计算缓存命中率。
+// 分母为 0 时返回 0：0 除以 0 的结果是 NaN，而 NaN 不是合法的 JSON，
+// 序列化会失败并且让整个统计接口返回错误，因此必须先判断分母。
+func cacheHitRate(hits int64, misses int64) float64 {
+	total := hits + misses
+	if total == 0 {
+		return 0
+	}
+
+	return float64(hits) / float64(total)
+}
+
+// ---------------------------------------------------------------------------
+// 处理函数。handleHealthz 与其余六个处理函数都已经实现，任务分组编号写在各自上方。
 //
 // 全部处理函数的第一个参数都是 *gin.Context，它是 gin 对「一次请求的上下文」的封装，
 // 同时提供读取请求（c.Request、c.Param、c.Query）与写出响应（c.JSON、c.Data、c.Redirect）
@@ -145,7 +229,7 @@ func (s *Server) handleHealthz(c *gin.Context) {
 
 // handleReadyz 是就绪探针的检查端点，对应接口契约中的 GET /api/readyz。
 //
-// TODO(第 7 组)：由你实现本函数。
+// 本函数已经实现。
 //
 // 实现要求：
 //  1. 依次检查 PostgreSQL 与 Redis 是否可达，调用 store.Postgres 的 Ping 方法与
@@ -167,12 +251,39 @@ func (s *Server) handleHealthz(c *gin.Context) {
 //
 // 验收方式：见 TASKS.md 第 7 组的验收表。
 func (s *Server) handleReadyz(c *gin.Context) {
-	s.writeError(c, http.StatusNotImplemented, todo.Message("httpapi.Server.handleReadyz", 7))
+	// 两个检查共用同一个父 context，也就是本次请求的 context：
+	// 客户端断开连接时父 context 被取消，两个检查会一起结束。
+	parent := c.Request.Context()
+
+	// 两次检查都执行，不因为 PostgreSQL 检查失败就跳过 Redis。
+	// checks 字段同时返回两个依赖的状态，排障时一次就能看清全部原因，
+	// 而不是修好一个之后才发现另一个也有问题。
+	postgresErr := checkDependency(parent, s.store.Ping)
+	redisErr := checkDependency(parent, s.cache.Ping)
+
+	checks := make(map[string]string, 2)
+
+	checks["postgres"] = "ok"
+	if postgresErr != nil {
+		checks["postgres"] = postgresErr.Error()
+	}
+
+	checks["redis"] = "ok"
+	if redisErr != nil {
+		checks["redis"] = redisErr.Error()
+	}
+
+	if postgresErr != nil || redisErr != nil {
+		c.JSON(http.StatusServiceUnavailable, readinessResponse{Status: "not ready", Checks: checks})
+		return
+	}
+
+	c.JSON(http.StatusOK, readinessResponse{Status: "ready", Checks: checks})
 }
 
 // handleCreateLink 创建短链接，对应接口契约中的 POST /api/links。
 //
-// TODO(第 4 组)：由你实现本函数。
+// 本函数已经实现。
 //
 // 实现要求：
 //  1. 调用 decodeJSON(c, &请求变量) 解析请求体，解析失败时返回 400 与
@@ -196,12 +307,91 @@ func (s *Server) handleReadyz(c *gin.Context) {
 //
 // 验收方式：见 TASKS.md 第 4 组的验收表。
 func (s *Server) handleCreateLink(c *gin.Context) {
-	s.writeError(c, http.StatusNotImplemented, todo.Message("httpapi.Server.handleCreateLink", 4))
+	var req createLinkRequest
+
+	// 请求体的解析与字段校验全部发生在访问数据库之前，
+	// 因此非法的请求不会占用数据库连接。
+	if err := decodeJSON(c, &req); err != nil {
+		s.writeError(c, http.StatusBadRequest, "请求体不是合法的 JSON")
+		return
+	}
+
+	if req.URL == "" {
+		s.writeError(c, http.StatusBadRequest, "url 字段不能为空")
+		return
+	}
+
+	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
+		s.writeError(c, http.StatusBadRequest, "url 字段必须以 http:// 或 https:// 开头")
+		return
+	}
+
+	if len(req.URL) > maxURLLength {
+		s.writeError(c, http.StatusBadRequest, "url 字段长度超过 2048")
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	var (
+		code    string
+		created bool
+	)
+
+	// 循环内部每一轮都重新生成短码。短码在循环之外只生成一次时，
+	// 后续几轮插入的仍然是同一个短码，重试机制会完全失效。
+	for attempt := 1; attempt <= maxCreateAttempts; attempt++ {
+		generated, err := shortcode.Generate()
+		if err != nil {
+			// 随机源故障与主键冲突是两类不同的原因，因此这个分支不进入重试。
+			s.logger.Error("生成短码失败", "错误", err.Error())
+			s.writeError(c, http.StatusInternalServerError, "服务器内部错误")
+			return
+		}
+
+		code = generated
+
+		err = s.store.CreateLink(ctx, store.Link{Code: code, URL: req.URL})
+		if err == nil {
+			created = true
+			break
+		}
+
+		// 只有主键冲突可以重试。冲突概率等于当前记录数除以 62 的 6 次方，
+		// 正常情况下极小，连续冲突说明存在更严重的问题。
+		if errors.Is(err, store.ErrConflict) {
+			s.logger.Warn("短码已经被占用，重新生成之后再试一次", "短码", code, "第几次尝试", attempt)
+			continue
+		}
+
+		s.logger.Error("写入数据库失败", "错误", err.Error())
+		s.writeError(c, http.StatusServiceUnavailable, "依赖服务不可用")
+		return
+	}
+
+	if !created {
+		s.logger.Error("连续生成的短码都被占用，放弃本次创建", "尝试次数", maxCreateAttempts)
+		s.writeError(c, http.StatusInternalServerError, "服务器内部错误")
+		return
+	}
+
+	// 回读一次刚写入的记录。store.CreateLink 只返回 error，
+	// 而契约要求 201 响应中包含由数据库生成的 clicks 与 createdAt，
+	// 因此这里必须再查询一次，不能使用请求中的取值直接拼装响应。
+	link, err := s.store.GetLink(ctx, code)
+	if err != nil {
+		s.logger.Error("回读刚创建的记录失败", "短码", code, "错误", err.Error())
+		s.writeError(c, http.StatusServiceUnavailable, "依赖服务不可用")
+		return
+	}
+
+	s.logger.Info("短链接创建成功", "短码", code)
+	c.JSON(http.StatusCreated, toLinkResponse(link))
 }
 
 // handleListLinks 分页列出短链接，对应接口契约中的 GET /api/links。
 //
-// TODO(第 4 组)：由你实现本函数。
+// 本函数已经实现。
 //
 // 实现要求：
 //  1. limit 参数的默认值是 20，上限是 100；offset 参数的默认值是 0。
@@ -219,12 +409,58 @@ func (s *Server) handleCreateLink(c *gin.Context) {
 //
 // 验收方式：见 TASKS.md 第 4 组的验收表。
 func (s *Server) handleListLinks(c *gin.Context) {
-	s.writeError(c, http.StatusNotImplemented, todo.Message("httpapi.Server.handleListLinks", 4))
+	// 查询参数的取值类型永远是字符串，缺失时由 DefaultQuery 提供默认值，
+	// 整数转换与范围校验由本函数自己完成。
+	limitText := c.DefaultQuery("limit", strconv.Itoa(defaultListLimit))
+	offsetText := c.DefaultQuery("offset", "0")
+
+	limit, err := strconv.Atoi(limitText)
+	if err != nil {
+		s.writeError(c, http.StatusBadRequest, "limit 参数必须是整数")
+		return
+	}
+	if limit < 1 || limit > maxListLimit {
+		s.writeError(c, http.StatusBadRequest, "limit 参数必须在 1 到 100 之间")
+		return
+	}
+
+	offset, err := strconv.Atoi(offsetText)
+	if err != nil {
+		s.writeError(c, http.StatusBadRequest, "offset 参数必须是整数")
+		return
+	}
+	if offset < 0 {
+		s.writeError(c, http.StatusBadRequest, "offset 参数不能小于 0")
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	links, err := s.store.ListLinks(ctx, limit, offset)
+	if err != nil {
+		s.logger.Error("查询列表失败", "错误", err.Error())
+		s.writeError(c, http.StatusServiceUnavailable, "依赖服务不可用")
+		return
+	}
+
+	total, err := s.store.CountLinks(ctx)
+	if err != nil {
+		s.logger.Error("查询记录总数失败", "错误", err.Error())
+		s.writeError(c, http.StatusServiceUnavailable, "依赖服务不可用")
+		return
+	}
+
+	c.JSON(http.StatusOK, linkListResponse{
+		Items:  toLinkResponses(links),
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
+	})
 }
 
 // handleDeleteLink 删除短链接，对应接口契约中的 DELETE /api/links/{code}。
 //
-// TODO(第 6 组)：由你实现本函数。
+// 本函数已经实现。
 //
 // 实现要求：
 //  1. 短码从路径参数中读取，写法是 c.Param("code")，
@@ -246,12 +482,37 @@ func (s *Server) handleListLinks(c *gin.Context) {
 //
 // 验收方式：见 TASKS.md 第 6 组的验收表。
 func (s *Server) handleDeleteLink(c *gin.Context) {
-	s.writeError(c, http.StatusNotImplemented, todo.Message("httpapi.Server.handleDeleteLink", 6))
+	code := c.Param("code")
+	ctx := c.Request.Context()
+
+	err := s.store.DeleteLink(ctx, code)
+	if errors.Is(err, store.ErrNotFound) {
+		s.writeError(c, http.StatusNotFound, "短码不存在")
+		return
+	}
+	if err != nil {
+		s.logger.Error("删除记录失败", "短码", code, "错误", err.Error())
+		s.writeError(c, http.StatusServiceUnavailable, "依赖服务不可用")
+		return
+	}
+
+	// 数据库删除成功之后才删除缓存中的两个键。顺序颠倒时，
+	// 数据库删除失败会让缓存中的记录提前消失，后续请求回落到数据库之后
+	// 又会把这条记录重新填充进缓存，表现为「删除操作看起来没有生效」。
+	if err := s.cache.DeleteLink(ctx, code); err != nil {
+		// 缓存键带有生存时间，删除失败也会自动过期，而数据库中的记录已经删除，
+		// 数据最终是一致的，因此这里只记录警告，不让整个请求失败。
+		s.logger.Warn("删除缓存键失败，键会随生存时间自动过期", "短码", code, "错误", err.Error())
+	}
+
+	// 204 表示操作成功并且响应体为空。这里必须使用 c.Status，
+	// 使用 c.JSON(http.StatusNoContent, nil) 会写出一个内容为 null 的响应体。
+	c.Status(http.StatusNoContent)
 }
 
 // handleStats 返回汇总统计，对应接口契约中的 GET /api/stats。
 //
-// TODO(第 6 组)：由你实现本函数。
+// 本函数已经实现。
 //
 // 实现要求：
 //  1. 调用 s.store.CountLinks 取得短链接总数，调用 s.store.SumClicks 取得累计点击数。
@@ -265,12 +526,41 @@ func (s *Server) handleDeleteLink(c *gin.Context) {
 //
 // 验收方式：见 TASKS.md 第 6 组的验收表。
 func (s *Server) handleStats(c *gin.Context) {
-	s.writeError(c, http.StatusNotImplemented, todo.Message("httpapi.Server.handleStats", 6))
+	ctx := c.Request.Context()
+
+	links, err := s.store.CountLinks(ctx)
+	if err != nil {
+		s.logger.Error("查询记录总数失败", "错误", err.Error())
+		s.writeError(c, http.StatusServiceUnavailable, "依赖服务不可用")
+		return
+	}
+
+	clicks, err := s.store.SumClicks(ctx)
+	if err != nil {
+		s.logger.Error("查询点击总数失败", "错误", err.Error())
+		s.writeError(c, http.StatusServiceUnavailable, "依赖服务不可用")
+		return
+	}
+
+	hits, misses, err := s.cache.CacheStats(ctx)
+	if err != nil {
+		s.logger.Error("读取缓存统计失败", "错误", err.Error())
+		s.writeError(c, http.StatusServiceUnavailable, "依赖服务不可用")
+		return
+	}
+
+	c.JSON(http.StatusOK, statsResponse{
+		Links:        links,
+		Clicks:       clicks,
+		CacheHits:    hits,
+		CacheMisses:  misses,
+		CacheHitRate: cacheHitRate(hits, misses),
+	})
 }
 
 // handleRedirect 执行短码跳转，对应接口契约中的 GET /{code}。
 //
-// TODO(第 5 组)：由你实现本函数。
+// 本函数已经实现。
 //
 // 实现要求：
 //  1. 从路径参数读取短码，写法是 c.Param("code")；
@@ -300,5 +590,75 @@ func (s *Server) handleStats(c *gin.Context) {
 //
 // 验收方式：见 TASKS.md 第 5 组的验收表。
 func (s *Server) handleRedirect(c *gin.Context) {
-	s.writeError(c, http.StatusNotImplemented, todo.Message("httpapi.Server.handleRedirect", 5))
+	code := c.Param("code")
+
+	// 格式校验放在最前面：不通过时直接返回 404，不访问任何依赖。
+	if !isShortCodeFormat(code) {
+		writeRedirectNotFound(c)
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	url, err := s.cache.GetURL(ctx, code)
+	if err == nil {
+		if err := s.cache.RecordCacheResult(ctx, true); err != nil {
+			s.logger.Warn("记录缓存命中次数失败", "错误", err.Error())
+		}
+
+		s.redirectAndCount(c, code, url)
+		return
+	}
+
+	// 只有「未命中」可以回落到数据库查询，其余错误说明 Redis 不可用。
+	// 这两类情况必须分开处理：把连接故障当作未命中时，
+	// 每一个请求都会打到数据库上，缓存完全失效但表面上仍然工作。
+	if !errors.Is(err, cache.ErrMiss) {
+		s.logger.Error("读取缓存失败", "短码", code, "错误", err.Error())
+		s.writeError(c, http.StatusServiceUnavailable, "依赖服务不可用")
+		return
+	}
+
+	if err := s.cache.RecordCacheResult(ctx, false); err != nil {
+		s.logger.Warn("记录缓存未命中次数失败", "错误", err.Error())
+	}
+
+	link, err := s.store.GetLink(ctx, code)
+	if errors.Is(err, store.ErrNotFound) {
+		writeRedirectNotFound(c)
+		return
+	}
+	if err != nil {
+		s.logger.Error("查询数据库失败", "短码", code, "错误", err.Error())
+		s.writeError(c, http.StatusServiceUnavailable, "依赖服务不可用")
+		return
+	}
+
+	// 读时回填：把数据库中的长网址写进缓存，生存时间取配置中的取值。
+	// 回填失败不影响本次跳转，只记录警告。
+	if err := s.cache.SetURL(ctx, code, link.URL, s.cfg.CacheTTL); err != nil {
+		s.logger.Warn("回填缓存失败", "短码", code, "错误", err.Error())
+	}
+
+	s.redirectAndCount(c, code, link.URL)
+}
+
+// redirectAndCount 写出跳转响应，然后累加点击增量。
+//
+// 两步的失败互不影响：用户已经拿到目标地址之后，丢一次统计比让用户看到错误页面更合适，
+// 因此累加失败只记录警告日志。
+func (s *Server) redirectAndCount(c *gin.Context, code string, url string) {
+	// 使用 302 而不是 301：301 表示永久重定向，会被浏览器长期缓存，
+	// 之后即使数据库中的记录被删除，浏览器仍然会直接跳转而不访问本服务。
+	c.Redirect(http.StatusFound, url)
+
+	if err := s.cache.IncrClick(c.Request.Context(), code); err != nil {
+		s.logger.Warn("累加点击增量失败", "短码", code, "错误", err.Error())
+	}
+}
+
+// writeRedirectNotFound 写出短码不存在的 404 页面。
+// 这个端点面向浏览器，因此响应体是 HTML 而不是 JSON。
+func writeRedirectNotFound(c *gin.Context) {
+	c.Data(http.StatusNotFound, "text/html; charset=utf-8", []byte(redirectNotFoundHTML))
 }
