@@ -69,6 +69,13 @@ kind load docker-image shortener-api:dev shortener-web:dev --name shortener
 
 按编号顺序创建文件，这样 `kubectl apply -f code/shortener/k8s/` 这条命令会按文件名排序依次执行，而被引用的对象（命名空间、ConfigMap、Secret、Service）总是先于引用它的对象（StatefulSet、Deployment）被创建。
 
+顶层目录与模板目录的分工如下表。这份分工存在的必要性是：`kubectl apply -f <目录>` 在不加 `-R` 参数时不会递归进入子目录，因此存放在 `templates/` 中的模板文件不会被应用；如果模板与纯净版放在同一层目录中，同名的对象会被应用两次，而模板中留空的取值会使校验失败。
+
+| 目录 | 存放的内容 | 是否参与 `kubectl apply -f code/shortener/k8s/` |
+|---|---|---|
+| `k8s/` 顶层 | 不带注释、取值已经填写的纯净版清单 | 参与，目录中每个 `.yaml` 文件都会按文件名顺序被应用 |
+| `k8s/templates/` | 带完整注释的模板，其中每个键都写明取值、设置理由与写错的后果 | 不参与，因为该命令不递归子目录；需要单独应用模板时要在命令中显式写出模板的路径 |
+
 | 序号 | 文件名 | 创建的对象 | 依赖的前序文件 | 完成标志 |
 |---|---|---|---|---|
 | 1 | `00-namespace.yaml` | Namespace `shortener` | 无 | `kubectl get ns shortener` 的输出中状态是 `Active` |

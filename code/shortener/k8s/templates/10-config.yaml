@@ -1,0 +1,154 @@
+# ---------------------------------------------------------------------------
+# 10-config.yaml · 配置对象（ConfigMap 与 Secret）· 带注释的模板
+#
+# 本文件的位置与用途：它位于 k8s/templates/ 目录中，是带完整注释的模板，
+#   供填写顶层目录中的纯净版清单时对照阅读。
+#   顶层目录中的 k8s/10-config.yaml 是不带注释、取值留空的纯净版，实际执行 kubectl apply 的是纯净版。
+#   本模板不会被执行，原因是 kubectl apply -f <目录> 在不加 -R 参数时不会递归进入子目录；
+#   如果把模板与纯净版放在同一层目录中，同名的两个对象都会被应用一次，而模板中留空的取值会让校验失败。
+#
+# 本文件创建两个对象，它们的共同作用是承载「注入到工作负载里的取值」：
+#   ConfigMap  api-config      存放不含敏感信息的普通取值，由后端容器读取
+#   Secret     postgres-secret 存放包含口令的取值，由后端容器与数据库容器共同读取
+#
+# 这份文件与 compose.yaml 中 api 服务的 environment 段落是同一件事的两种实现：
+#   Compose 形态把取值直接写在 environment 下面，K8s 形态把取值写在 ConfigMap 与 Secret 里，
+#   再由工作负载用 env 或者 envFrom 引用，两种方式最终都变成进程的环境变量。
+#
+# 判断依据（决定一个取值应当放进哪个对象）：
+#   只要取值中包含口令、令牌、私钥中的任何一项，就放进 Secret；其余取值放进 ConfigMap。
+#   本项目的 DATABASE_URL 里面嵌着数据库口令，因此它必须放进 Secret；
+#   POSTGRES_USER、POSTGRES_PASSWORD、POSTGRES_DB 三个取值用于数据库初始化，其中含口令，因此也放进 Secret。
+#
+# 需要说明的一点：Secret 只解决「取值不在常规输出里直接显示」这件事，它不是加密机制。
+#   etcd 中保存的内容默认是 base64 编码之后的文本，决定谁能读取 Secret 的是 RBAC 配置与 etcd 的加密设置。
+#   验证方式：kubectl get secret postgres-secret -n shortener -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d
+#
+# 填写方式：下面每一个键的上面都用注释写出了这个键的取值与理由，把取值填在键名后面的冒号之后即可。
+#   取值留空时该键的值是 null，而 ConfigMap 与 Secret 的取值必须是字符串，
+#   因此校验命令会报 invalid type ... got "null", expected "string"，这是预期现象，填写完成之后该错误消失。
+#
+# 被引用位置：api-config 由 40-api.yaml 引用，postgres-secret 由 20-postgres.yaml 与 40-api.yaml 引用。
+#   引用方必须在被引用的键存在之后才能创建，因此本文件的编号前缀是 10，排在 20 与 40 之前。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  namespace: shortener
+  labels:
+    app.kubernetes.io/part-of: shortener
+# data 下面是键值对，键名就是容器中的环境变量名称，键与值都必须是字符串。
+# 下面四个键刻意不写，后端会使用 config.Load 中定义的默认值，缺失它们不构成错误：
+#   HTTP_ADDR       默认值 :8080
+#   REDIS_DB        默认值 0
+#   REDIS_PASSWORD  默认值空字符串
+data:
+  # REDIS_ADDR：后端连接缓存使用的地址。
+  # 取值：redis:6379
+  # 理由：主机名部分必须写成同命名空间内 Service 的名称，30-redis.yaml 中的 Service 就命名为 redis；
+  #       同一个命名空间内的 Pod 可以直接使用 Service 的短名称，跨命名空间时才需要写出完整域名。
+  # 写错的后果：写成 localhost:6379 时，后端容器连接的是它自己，日志中出现连接被拒绝；
+  #       写成不存在的名称时 DNS 解析失败，就绪检查返回 503 并且 Pod 的 READY 列一直是 0/1。
+  REDIS_ADDR:
+
+  # CACHE_TTL：短链接缓存键 link:{code} 的生存时间。
+  # 取值：300s
+  # 理由：接口契约规定这个生存时间是 300 秒，与后端 config.Load 的默认值一致；
+  #       把它显式写出来的目的是让这个取值在集群清单里可见，而不是藏在编译进二进制的默认值里。
+  # 取值写法：字符串 "300s" 由 Go 的 time.ParseDuration 解析，s 表示秒；
+  #       这里不需要额外加引号，因为取值本身包含字母，YAML 会把它当作字符串；
+  #       如果某个键要写纯数字（例如 REDIS_DB 要写 0），必须写成 "0"，否则 YAML 会把它解析成整数，
+  #       而 ConfigMap 的取值必须是字符串，服务端会以类型错误拒绝。
+  CACHE_TTL:
+
+  # CLICK_FLUSH_INTERVAL：后台协程把 Redis 中的点击增量写回 PostgreSQL 的周期。
+  # 取值：5s
+  # 理由：周期越短，数据库中的数据越接近实时，代价是每一轮都要发起数据库写入；
+  #       5 秒是本地演示与观察都方便的一个取值。
+  # 对照实验：把这个取值改成 60s 并执行 kubectl rollout restart deployment/api -n shortener 之后，
+  #       跳转若干次可以观察到 Redis 中的增量在累积，而数据库中的 clicks 列仍然是 0；
+  #       这也是「写合并会丢失最后一轮增量」这条边界条件的演示方式。
+  CLICK_FLUSH_INTERVAL:
+
+  # SHUTDOWN_TIMEOUT：后端收到停止信号之后，等待 HTTP 连接收尾与最后一次写回完成的时限。
+  # 取值：10s
+  # 理由：它决定优雅退出的时间上界，取值必须大于一次写回所需的时间，一次写回只涉及若干条短码的批量更新。
+  # 关联字段：40-api.yaml 中 Pod 的 terminationGracePeriodSeconds 必须大于这个取值（那里取 30），
+  #       否则 kubelet 会在写回完成之前发送 SIGKILL，这一轮的点击增量会留在 Redis 中等待下一次写回。
+  SHUTDOWN_TIMEOUT:
+
+  # GIN_MODE：gin 框架的运行模式。
+  # 取值：release
+  # 理由：gin 的默认取值是 debug，debug 模式下每个请求都会向标准输出写调试信息；
+  #       集群中的标准输出会被日志采集组件长期保存，因此集群环境显式关闭调试输出。
+  # 注意：本地联调时可以用 GIN_MODE=debug 覆盖，用来查看启动时打印的路由清单。
+  GIN_MODE:
+
+  # POSTGRES_INITDB_ARGS：数据库首次初始化时传给 initdb 的参数。
+  # 取值："--encoding=UTF8 --locale=C"（取值中包含空格，因此必须用引号包起来）
+  # 理由：固定编码与排序规则，避免不同机器上同一个查询返回的顺序不一致；
+  #       这个键由 postgres 官方镜像的入口脚本读取，与后端代码无关。
+  POSTGRES_INITDB_ARGS:
+---
+# ---------------------------------------------------------------------------
+# 第二个对象：Secret postgres-secret
+#
+# 为什么写 stringData 而不是 data：
+#   data 里面的值必须是写入方自己做过 base64 编码的内容；
+#   stringData 里面的值写明文，API 服务器在写入 etcd 之前会替写入方完成编码。
+#   两种写法最终存储在 etcd 中的内容相同，区别只在「编码由谁完成」；
+#   本文件使用 stringData，原因是明文写出来便于人工核对，不需要借助编码命令生成取值。
+#   同一个键同时出现在两个字段中时，stringData 的取值优先。
+#
+# 为什么后端只需要一个 DATABASE_URL，而数据库需要三个 POSTGRES_* 变量：
+#   这两组取值的读取方不同，因此需要的字段形态也不同。
+#   postgres 官方镜像的入口脚本要用 POSTGRES_USER、POSTGRES_PASSWORD、POSTGRES_DB 三个独立变量
+#   执行 initdb 与创建默认数据库，它不接受一个连接串；
+#   后端使用 pgx 驱动，它只解析 DATABASE_URL 这一个连接串，因此后端不需要那三个变量。
+#   两边的取值必须彼此一致，否则后端会以错误的用户或者错误的库名连接数据库。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: shortener
+  labels:
+    app.kubernetes.io/part-of: shortener
+# type 不写时默认取值是 Opaque，也就是「自定义的键值对集合」，本项目属于这一类。
+type: Opaque
+stringData:
+  # DATABASE_URL：后端连接 PostgreSQL 使用的连接串。
+  # 取值：postgres://shortener:shortener_dev_password@postgres:5432/shortener?sslmode=disable
+  # 格式拆解：postgres://<用户>:<口令>@<主机>:<端口>/<库名>?<连接参数>
+  #   用户与口令必须与下面 POSTGRES_USER、POSTGRES_PASSWORD 的取值完全一致；
+  #   主机必须是 20-postgres.yaml 中 Service 的名称 postgres，
+  #     写成 localhost 时后端连接的是它自己所在的容器，日志中出现连接被拒绝；
+  #   sslmode=disable 表示不对连接启用 TLS，集群内部的容器网络不需要 TLS；
+  #     数据库镜像默认也没有开启 TLS，把这个参数改掉会让连接握手失败。
+  # 放置位置：这个取值必须放在 Secret，因为它里面嵌着数据库口令。
+  DATABASE_URL:
+
+  # POSTGRES_USER：数据库初始化时创建的用户名。
+  # 取值：shortener
+  POSTGRES_USER:
+
+  # POSTGRES_PASSWORD：上面这个用户的登录口令。
+  # 取值：shortener_dev_password
+  POSTGRES_PASSWORD:
+
+  # POSTGRES_DB：初始化时创建的数据库名称。
+  # 取值：shortener
+  # 说明：这个库由官方镜像在初始化阶段创建，后端启动时的建表语句执行在这个库里面。
+  POSTGRES_DB:
+# ---------------------------------------------------------------------------
+# 填写完成之后的核对命令（三条，按顺序执行）：
+#   1. kubectl apply -f code/shortener/k8s/10-config.yaml --dry-run=client
+#      预期：输出 configmap/api-config created (dry run) 与 secret/postgres-secret created (dry run)
+#   2. kubectl apply -f code/shortener/k8s/10-config.yaml
+#      预期：输出 configmap/api-config created 与 secret/postgres-secret created
+#   3. kubectl get cm api-config -n shortener -o yaml 与 kubectl get secret postgres-secret -n shortener -o yaml
+#      预期：两个对象的 data 或者 stringData 中都有本文件写出的全部键；
+#            另外可以执行下面这条命令核对口令是否正确写入：
+#            kubectl get secret postgres-secret -n shortener -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d
+# ---------------------------------------------------------------------------

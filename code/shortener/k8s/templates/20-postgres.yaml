@@ -1,0 +1,193 @@
+# ---------------------------------------------------------------------------
+# 20-postgres.yaml · 数据库（Headless Service 与 StatefulSet）· 带注释的模板
+#
+# 本文件的位置与用途：它位于 k8s/templates/ 目录中，是带完整注释的模板，
+#   供填写顶层目录中的纯净版清单时对照阅读。
+#   顶层目录中的 k8s/20-postgres.yaml 是不带注释、部分取值留空的纯净版，实际执行 kubectl apply 的是纯净版。
+#   本模板不会被执行，原因是 kubectl apply -f <目录> 在不加 -R 参数时不会递归进入子目录。
+#
+# 本文件创建两个对象，它们共同构成数据库这一个组件：
+#   Service      postgres  类型是 Headless（clusterIP 的取值是 None），为 StatefulSet 的 Pod 提供稳定的网络标识
+#   StatefulSet  postgres  副本数为 1 的数据库工作负载，用 volumeClaimTemplates 为 Pod 申请持久化存储
+#
+# 这两个对象在整个系统中的位置（从后端的视角看一次连接经过的环节）：
+#   第一步：后端容器读取环境变量 DATABASE_URL，取值来自 10-config.yaml 中的 Secret postgres-secret；
+#   第二步：连接串中的主机名是 postgres，它由集群内部的 DNS 解析成本文件中的 Service；
+#   第三步：Service 的选择器挑出标签是 app: postgres 的 Pod，也就是 postgres-0；
+#   第四步：连接请求被转发到该 Pod 的 5432 端口，由容器中的数据库进程处理；
+#   第五步：数据文件位于挂载目录 /var/lib/postgresql/data 之下，该目录对应 PVC data-postgres-0。
+#
+# 与 compose.yaml 的对应关系：
+#   compose 的 services.postgres 对应本文件的 StatefulSet；
+#   compose 的 volumes.postgres-data 这个具名卷对应本文件的 volumeClaimTemplates；
+#   compose 的 environment 对应本文件中 env 字段引用的 Secret 与 ConfigMap；
+#   compose 的 healthcheck 对应本文件中的两个探针；
+#   compose 的 ports（"5432:5432"）在本文件中只保留 Service 与 containerPort 两层，
+#     因为集群内部访问数据库不需要把端口发布到宿主机。
+#
+# 填写方式：本模板中的取值已经写出，顶层纯净版中的对应位置留空，按注释中的取值填入即可。
+#   取值留空的字段在 YAML 中的值是 null，因此填写完成之前的校验命令会报类型错误，填写完成之后该错误消失。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: shortener
+  labels:
+    app.kubernetes.io/part-of: shortener
+spec:
+  # clusterIP 的取值是 None 时，这个 Service 就是 Headless Service：它不分配虚拟 IP，
+  # DNS 查询返回的是后端 Pod 的地址列表，而不是一个由 kube-proxy 维护的代理地址。
+  # 数据库使用 Headless 的必要性：数据库副本之间不是等价关系，客户端必须连接到确定的那一个实例；
+  # 普通 Service 的虚拟 IP 只负责在一组等价副本之间做转发，它不能满足数据库对稳定标识的要求。
+  clusterIP: None
+  selector:
+    # 这个选择器必须与下面 StatefulSet 的 template.metadata.labels 逐字一致。
+    # 不一致时 Endpoints 中没有任何地址，后端连接 postgres 这个名称时会得到连接被拒绝，
+    # 而 Pod 本身显示 Running，容易把原因误判成数据库没有启动。
+    app: postgres
+  ports:
+    # 端口名在单端口 Service 中不是必须项，写出来的目的是让规则在多人协作时更易读。
+    - name: postgres
+      # port 是 Service 暴露的端口，targetPort 是容器监听的端口；
+      # 两者写成相同取值是因为数据库容器的监听端口就是 5432。
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: shortener
+  labels:
+    app.kubernetes.io/part-of: shortener
+spec:
+  # serviceName 指向上面这个 Headless Service，它决定 Pod 的 DNS 域名，
+  # Postgres 这一个 Pod 的完整域名形态是 postgres-0.postgres.shortener.svc.cluster.local。
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          # 镜像与 compose.yaml 中的镜像保持一致。
+          # 选择 alpine 版本的原因有两个：镜像体积更小；镜像中包含 sh 与 psql，
+          # kubectl exec 进入容器之后可以直接执行 psql 与 pg_isready 进行排障。
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            # 下面四个变量由 postgres 官方镜像的入口脚本读取。
+            # 镜像在数据目录为空时执行 initdb，用这三个变量创建超级用户与默认数据库；
+            # 数据目录已经初始化过时，这三个变量不再参与初始化，数据库直接启动。
+            # 取值全部来自 10-config.yaml，其中口令与连接串中的口令必须一致，
+            # 否则后端会以错误的口令尝试登录，日志中出现口令验证失败的提示。
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_DB
+            - name: POSTGRES_INITDB_ARGS
+              valueFrom:
+                configMapKeyRef:
+                  name: api-config
+                  key: POSTGRES_INITDB_ARGS
+            # PGDATA 指向挂载目录之下的子目录，而不是挂载目录本身。
+            # 这样写的原因有两类：第一类是可移植性，某些类型的卷在根目录中会带上 lost+found 一类的系统目录，
+            # 初始化程序会因为「目录非空」而拒绝执行 initdb；
+            # 第二类是明确性，把数据文件与卷中可能存在的其他内容分开放置。
+            # 需要注意 volumeMounts 中的 mountPath 仍然是挂载目录的上一级，两者不要写成同一个取值。
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            # name 必须与 volumeClaimTemplates 中 metadata.name 的取值一致，
+            # 这个名称是「容器内的挂载点」与「存储申请」之间的连接键。
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # 就绪探针使用 pg_isready：它执行一次真实的数据库连接尝试，返回 0 表示数据库可以接受查询。
+          # 不使用 tcpSocket 探针的原因：端口处于监听状态只说明进程已经启动，
+          # 此时数据库可能仍在执行初始化或者正在回放日志，接收流量会产生错误响应。
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "shortener", "-d", "shortener"]
+            # initialDelaySeconds 取 10 的原因：首次启动要执行 initdb，耗时通常为若干秒；
+            # 取值过小时，探针在初始化期间反复失败，Pod 会在进度条上表现为长时间不就绪。
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # 存活探针使用与就绪探针相同的命令，但判断阈值更宽松。
+          # 这样安排的原因是：就绪探针失败只需要摘掉流量，代价很小；
+          # 存活探针失败会重启数据库容器，代价很大，因此它的判定条件必须更保守。
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "shortener", "-d", "shortener"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # requests 决定调度器把 Pod 放到哪个节点上，limits 决定容器最多能用多少资源。
+          # 数据库的取值高于后端的原因：initdb 阶段与查询阶段都需要较多的内存，
+          # 内存上限取得过低会让数据库进程被内核终止，容器以退出码 137 结束并反复重启。
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+  # volumeClaimTemplates 是 StatefulSet 独有的字段，它按副本序号为每一个 Pod 生成一份独立的存储申请。
+  # 生成的 PVC 名称由三部分组成：模板中的 name、StatefulSet 的名称、Pod 的序号，
+  # 因此本例中生成的 PVC 名称是 data-postgres-0。
+  # 这个名称与 Pod 名称绑定，因此删除 Pod 之后重建出来的新 Pod 仍然挂在同一份存储上，数据因此保留。
+  # 注意：把该字段写在 Deployment 的 template 中属于非法字段，API 服务器会直接拒绝该清单。
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        # ReadWriteOnce 表示同一时刻只能被一个节点以读写方式挂载，符合单副本数据库的使用方式。
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+        # storageClassName 刻意不写：不写时使用集群的默认 StorageClass。
+        # kind 创建的集群自带一个名为 standard 的默认 StorageClass，由 rancher.io/local-path 供给卷。
+        # 写成具体名称会让清单与特定集群绑定，换集群时需要修改清单。
+---
+# ---------------------------------------------------------------------------
+# 填写完成之后的核对命令（按顺序执行，其中第 3 条需要等待十几秒）：
+#   1. kubectl apply -f code/shortener/k8s/20-postgres.yaml --dry-run=client
+#      预期：输出 service/postgres created (dry run) 与 statefulset.apps/postgres created (dry run)
+#   2. kubectl apply -f code/shortener/k8s/20-postgres.yaml
+#      预期：输出 service/postgres created 与 statefulset.apps/postgres created
+#   3. kubectl get po -n shortener -w
+#      预期：出现 pod/postgres-0，状态从 Pending 或 ContainerCreating 变成 Running，
+#            READY 列由 0/1 变成 1/1；观察到 1/1 之后按 Ctrl+C 结束监视
+#   4. kubectl get pvc -n shortener
+#      预期：出现 data-postgres-0，STATUS 列是 Bound，CAPACITY 列是 1Gi
+#   5. kubectl get endpoints postgres -n shortener
+#      预期：ENDPOINTS 列有 1 个地址，形态是 <Pod IP>:5432；为空说明选择器与标签不匹配
+#   6. kubectl exec -n shortener postgres-0 -- psql -U shortener -d shortener -c 'select 1'
+#      预期：输出一个名为 ?column? 的列与取值 1，这一条同时证明用户、库名与网络连接都正确
+#   7. kubectl describe po postgres-0 -n shortener
+#      预期：Events 段落中没有 Warning 级别的记录，用来确认探针与卷挂载都没有问题
+# ---------------------------------------------------------------------------

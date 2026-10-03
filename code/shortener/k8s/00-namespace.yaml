@@ -1,0 +1,9 @@
+# code/shortener/k8s/00-namespace.yaml
+# 创建一个集群级对象 Namespace, 名称为 shortener
+# 之后的五个工作负载都会引用该 namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shortener
+  labels:
+    app.kubernetes.io/part-of: shortener

@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  namespace: shortener
+  labels:
+    app.kubernetes.io/part-of: shortener
+data:
+  REDIS_ADDR: "redis:6379"
+  CACHE_TTL: "300s"
+  CLICK_FLUSH_INTERVAL: "5s"
+  SHUTDOWN_TIMEOUT: "10s"
+  GIN_MODE: "release"
+  POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: shortener
+  labels:
+    app.kubernetes.io/part-of: shortener
+type: Opaque
+stringData:
+  DATABASE_URL: "postgres://shortener:shortener_dev_password@postgres:5432/shortener?sslmode=disable"
+  POSTGRES_USER: "shortener"
+  POSTGRES_PASSWORD: "shortener_dev_password"
+  POSTGRES_DB: "shortener"
