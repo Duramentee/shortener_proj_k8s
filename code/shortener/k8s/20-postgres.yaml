@@ -6,13 +6,13 @@ metadata:
   labels:
     app.kubernetes.io/part-of: shortener
 spec:
-  clusterIP:
+  clusterIP: None
   selector:
-    app:
+    app: postgres
   ports:
     - name: postgres
-      port:
-      targetPort:
+      port: 5432
+      targetPort: 5432
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -22,23 +22,23 @@ metadata:
   labels:
     app.kubernetes.io/part-of: shortener
 spec:
-  serviceName:
-  replicas:
+  serviceName: postgres
+  replicas: 1
   selector:
     matchLabels:
-      app:
+      app: postgres
   template:
     metadata:
       labels:
-        app:
+        app: postgres
     spec:
       containers:
         - name: postgres
-          image:
+          image: postgres:16-alpine
           imagePullPolicy: IfNotPresent
           ports:
             - name: postgres
-              containerPort:
+              containerPort: 5432
           env:
             - name: POSTGRES_USER
               valueFrom:
@@ -61,36 +61,37 @@ spec:
                   name: api-config
                   key: POSTGRES_INITDB_ARGS
             - name: PGDATA
-              value:
+              value: /var/lib/postgresql/data/pgdata
           volumeMounts:
             - name: data
-              mountPath:
+              mountPath: /var/lib/postgresql/data
           readinessProbe:
             exec:
-              command:
+              command: ["pg_isready", "-U", "shortener", "-d", "shortener"]
             initialDelaySeconds: 10
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
           livenessProbe:
             exec:
-              command:
+              command: ["pg_isready", "-U", "shortener", "-d", "shortener"]
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 6
           resources:
             requests:
-              cpu:
-              memory:
+              cpu: 100m
+              memory: 128Mi
             limits:
-              cpu:
-              memory:
+              cpu: 500m
+              memory: 512Mi
   volumeClaimTemplates:
     - metadata:
         name: data
       spec:
         accessModes:
+          - ReadWriteOnce
         resources:
           requests:
-            storage:
+            storage: 1Gi
