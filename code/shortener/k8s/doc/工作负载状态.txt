@@ -1,0 +1,24 @@
+NAME                    READY   UP-TO-DATE   AVAILABLE   AGE   CONTAINERS   IMAGES              SELECTOR
+deployment.apps/api     2/2     2            2           22h   api          shortener-api:dev   app=api
+deployment.apps/redis   1/1     1            1           22h   redis        redis:7-alpine      app=redis
+deployment.apps/web     2/2     2            2           22h   web          shortener-web:dev   app=web
+
+NAME                        READY   AGE   CONTAINERS   IMAGES
+statefulset.apps/postgres   1/1     28h   postgres     postgres:16-alpine
+
+NAME                         READY   STATUS    RESTARTS        AGE   IP            NODE                      NOMINATED NODE   READINESS GATES
+pod/api-57fdb44f7c-6p5hh     1/1     Running   3 (4h57m ago)   22h   10.244.0.10   shortener-control-plane   <none>           <none>
+pod/api-57fdb44f7c-mkrxx     1/1     Running   4 (4h57m ago)   22h   10.244.0.9    shortener-control-plane   <none>           <none>
+pod/postgres-0               1/1     Running   2 (4h58m ago)   27h   10.244.0.6    shortener-control-plane   <none>           <none>
+pod/redis-6b67dd7d68-6ggsl   1/1     Running   1 (4h58m ago)   22h   10.244.0.8    shortener-control-plane   <none>           <none>
+pod/web-688f8d8d55-dz6v8     1/1     Running   3 (4h57m ago)   22h   10.244.0.4    shortener-control-plane   <none>           <none>
+pod/web-688f8d8d55-jm5rg     1/1     Running   3 (4h57m ago)   22h   10.244.0.5    shortener-control-plane   <none>           <none>
+
+NAME               TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE   SELECTOR
+service/api        ClusterIP   10.96.34.68     <none>        8080/TCP       22h   app=api
+service/postgres   ClusterIP   None            <none>        5432/TCP       28h   app=postgres
+service/redis      ClusterIP   10.96.224.221   <none>        6379/TCP       22h   app=redis
+service/web        NodePort    10.96.157.27    <none>        80:30080/TCP   22h   app=web
+
+NAME                                    STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE   VOLUMEMODE
+persistentvolumeclaim/data-postgres-0   Bound    pvc-0486779e-9c72-4b77-a193-6524c39e5ce5   1Gi        RWO            standard       <unset>                 28h   Filesystem

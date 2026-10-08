@@ -178,7 +178,7 @@ kind load docker-image shortener-api:dev shortener-web:dev --name shortener
 
 第一，引用的键不存在时容器无法创建，Pod 会停在 `CreateContainerConfigError` 状态，因此 ConfigMap 与 Secret 必须先于 Deployment 创建。
 
-第二，用 `env` 方式注入的取值在容器创建时就固化成环境变量，之后修改 ConfigMap 不会影响已经运行的 Pod，必须执行 `kubectl rollout restart deployment/<名称> -n shortener` 触发一次滚动重建才会生效；只有把 ConfigMap 以卷的形式挂载时，文件内容才会自动更新。阶段 6 的第三个实验正是围绕这条规则设计的。
+第二，用 `env` 方式注入的取值在容器创建时就固化成环境变量，之后修改 ConfigMap 不会影响已经运行的 Pod，必须执行 `kubectl rollout restart deployment/<名称> -n shortener` 触发一次滚动重建才会生效；只有把 ConfigMap 以卷的形式挂载时，文件内容才会自动更新。阶段 6 的配置故障实验正是围绕这条规则设计的。
 
 ---
 
@@ -294,7 +294,7 @@ Headless Service 与 StatefulSet 的 `spec.serviceName` 字段互相引用：`se
 | 就绪探针 | `/api/readyz` | 检查，它必须同时确认 PostgreSQL 与 Redis 可用 | 把该 Pod 从 Service 的 Endpoints 中移除，不再向它转发流量，容器本身继续运行 | 依赖不可用时接收流量只会产生 `503` 响应，把它摘出流量入口可以让可用的副本继续服务 |
 | 存活探针 | `/api/healthz` | 不检查，它只证明进程仍然能够响应请求 | 重启容器 | 依赖故障属于外部状态，重启本进程既不能修复数据库，又会在依赖恢复之后造成全部副本同时冷启动；把依赖性检查放进存活探针会引发连锁重启 |
 
-如果读者把就绪检查放进存活探针，会观察到这样的现象：Redis 停止之后，两个 `api` Pod 的 `RESTARTS` 列持续增长，而故障本身并不要求重启任何后端进程。阶段 6 的附加实验就是复现这个现象。
+如果读者把就绪检查放进存活探针，会观察到这样的现象：Redis Service 暂时没有后端时，`api` Pod 的 `RESTARTS` 列开始增长，而故障本身并不要求重启任何后端进程。阶段 6 的探针对照实验就是复现这个现象。
 
 `terminationGracePeriodSeconds` 的作用可以用一条机制说明：kubelet 发送 `SIGTERM` 之后开始计时，计时到达该字段的取值时如果容器还没有退出，kubelet 会发送 `SIGKILL`。本项目在收到 `SIGTERM` 之后要用最多 `SHUTDOWN_TIMEOUT` 的 `10s` 完成最后一次点击增量写回，因此宽限期必须大于它，否则写回过程被强制中断，这一轮增量会留在 Redis 中，下次以相同短码触发跳转时可能被重复写回。
 
@@ -390,21 +390,12 @@ nodes:
 
 ---
 
-## 9. 阶段 6 的故障实验
+## 9. 阶段 6：故障排查与事故演练
 
-本阶段的验收标准与前面两个阶段不同，它不是「系统正常运行」，而是「每一类故障都在十分钟之内依据字段定位到原因」。因此每一项实验都要记录四个内容：注入方式、观察到的现象与字段、判断依据、恢复动作。
+阶段 6 已从部署参考中拆出，作为独立实操文档维护：
+[阶段 6：故障排查与事故演练手册](./TROUBLESHOOTING-LAB.md)。
 
-| 序号 | 故障类别 | 注入方式 | 预期现象与观察字段 | 判断依据与定位命令 | 恢复动作 |
-|---|---|---|---|---|---|
-| 1 | 镜像标签错误 | `kubectl set image deploy/api api=shortener-api:notexist -n shortener` | Pod 进入 `ImagePullBackOff` 或者 `ErrImageNeverPull`，`READY` 列是 `0/1`，`RESTARTS` 列是 `0` | `kubectl describe po -l app=api -n shortener`，输出末尾的 `Events` 段落中出现 `Failed to pull image "shortener-api:notexist"`；`RESTARTS` 为 `0` 说明容器从未启动，因此这不是应用崩溃 | `kubectl rollout undo deploy/api -n shortener` |
-| 2 | 就绪探针失败 | 先执行 `kubectl patch deploy/api -n shortener --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/api/not-exist"}]'` | `READY` 列变成 `0/1` 而 `RESTARTS` 列仍然是 `0`，同时 `kubectl get endpoints api -n shortener` 中的地址数量减少到零 | `kubectl describe po -l app=api -n shortener` 的 `Events` 段落中出现 `Readiness probe failed: HTTP probe failed with statuscode: 404`，同时 `kubectl get po` 显示状态是 `Running`，说明进程本身正常，失败的是流量准入判断 | `kubectl rollout undo deploy/api -n shortener` |
-| 3 | 依赖地址错误 | `kubectl patch cm api-config -n shortener --type=merge -p '{"data":{"REDIS_ADDR":"redis-wrong:6379"}}'`，随后执行 `kubectl rollout restart deploy/api -n shortener` | 新的 Pod 处于 `Running` 但 `READY` 列是 `0/1`，`RESTARTS` 列是 `0`；`kubectl exec` 进入容器执行就绪检查端口时得到 `503`，响应体中 `checks.redis` 是具体错误文本而 `checks.postgres` 仍然是 `ok` | `kubectl exec -n shortener deploy/api -- wget -qO- http://localhost:8080/api/readyz` 观察 `checks` 字段的两项取值；`kubectl logs -n shortener deploy/api` 中的连接错误文本包含被改写后的主机名；这一步验证「修改 ConfigMap 必须重启工作负载才生效」这条规则 | `kubectl patch cm api-config -n shortener --type=merge -p '{"data":{"REDIS_ADDR":"redis:6379"}}'`，再执行一次 `kubectl rollout restart deploy/api -n shortener` |
-| 4 | 内存超限 | `kubectl set resources deploy/api -n shortener --limits=memory=16Mi` | Pod 反复重启，`RESTARTS` 列持续增长，最终状态是 `CrashLoopBackOff` | `kubectl describe po -l app=api -n shortener` 中 `Last State` 段落出现 `Terminated`、`Reason: OOMKilled`、`Exit Code: 137`；`kubectl get po` 的 `STATUS` 列显示 `OOMKilled` 或 `CrashLoopBackOff`；`kubectl logs` 的末尾看不到应用自己的错误，因为进程被内核直接终止 | `kubectl set resources deploy/api -n shortener --limits=memory=256Mi` |
-| 5（附加） | 存活探针误检查依赖 | 先把存活探针的路径改成 `/api/readyz`，再执行 `kubectl scale deploy/redis -n shortener --replicas=0` | 两个 `api` Pod 的 `RESTARTS` 列在十几秒内持续增长，`kubectl get po -n shortener` 中 `redis` 的副本数变成零而 `api` 的副本不断重启 | `kubectl describe po -l app=api -n shortener` 中出现 `Liveness probe failed: HTTP probe failed with statuscode: 503`；对照第 2 项实验可以确认：同样是探针失败，写成就绪探针只摘流量，写成存活探针会重启进程 | 恢复存活探针的路径为 `/api/healthz`，再执行 `kubectl scale deploy/redis -n shortener --replicas=1` |
-
-执行第 3 项实验时有一个必须注意的顺序问题：ConfigMap 的改动不会自动影响已经运行的 Pod，必须显式触发滚动重建。如果跳过 `kubectl rollout restart` 这一步，会观察到「改动之后没有任何变化」，从而误判为改动没有生效。
-
----
+手册按照事件响应流程组织：实验准备 → 影响评估 → 分层诊断 → 单一故障注入 → 证据分析 → 服务恢复与验收 → 技术复盘及限时综合诊断。内容包括七项可逆实验、CPU 节流可选练习、限时综合诊断、逐步操作命令和实验记录模板。首次执行应依照实验顺序完成，并通过每项实验的基线检查与恢复验收。
 
 ## 10. 常见错误对照表
 
@@ -452,5 +443,5 @@ nodes:
 | 5 | 编写 `40-api.yaml` | ClusterIP Service 与两个副本的 Deployment | 两个 `api` Pod 的 `READY` 是 `1/1`，就绪检查端点返回 `ready` |
 | 6 | 编写 `50-web.yaml` | NodePort Service 与两个副本的 Deployment | 两个 `web` Pod 的 `READY` 是 `1/1`，`kubectl port-forward` 之后浏览器可以创建与跳转 |
 | 7 | 执行第 7 节与第 8 节的验收，并且记录实测取值 | 现象记录 | 九条验收命令与六条持久化验证步骤全部符合预期 |
-| 8 | 执行第 9 节的五项故障实验，并且为每一项记录四个内容 | 现象记录 | 每一项都能在十分钟之内依据字段写出原因 |
+| 8 | 按 [阶段 6 故障排查与事故演练手册](./TROUBLESHOOTING-LAB.md) 完成七项可逆实验、一次限时综合诊断，并填写实验记录 | 事故演练记录 | 能依据实测证据定位根因、恢复服务并验证业务；综合诊断至少 8/10 分 |
 | 9 | 把第 11 节的八条机制整理成笔记，并且按第 3 周的笔记结构补上「全流程工作链路」与「十分钟速记卡」 | 当天笔记 | 笔记中包含从 `kubectl apply` 到 Pod 就绪的全部阶段，每个阶段都写明执行者、输入、动作与观察方式 |
