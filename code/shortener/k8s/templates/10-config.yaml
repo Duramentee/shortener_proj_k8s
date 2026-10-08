@@ -3,7 +3,7 @@
 #
 # 本文件的位置与用途：它位于 k8s/templates/ 目录中，是带完整注释的模板，
 #   供填写顶层目录中的纯净版清单时对照阅读。
-#   顶层目录中的 k8s/10-config.yaml 是不带注释、取值留空的纯净版，实际执行 kubectl apply 的是纯净版。
+#   顶层目录中的 k8s/10-config.yaml 是不带注释、取值已经填写的纯净版，实际执行 kubectl apply 的是纯净版。
 #   本模板不会被执行，原因是 kubectl apply -f <目录> 在不加 -R 参数时不会递归进入子目录；
 #   如果把模板与纯净版放在同一层目录中，同名的两个对象都会被应用一次，而模板中留空的取值会让校验失败。
 #
@@ -24,9 +24,8 @@
 #   etcd 中保存的内容默认是 base64 编码之后的文本，决定谁能读取 Secret 的是 RBAC 配置与 etcd 的加密设置。
 #   验证方式：kubectl get secret postgres-secret -n shortener -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d
 #
-# 填写方式：下面每一个键的上面都用注释写出了这个键的取值与理由，把取值填在键名后面的冒号之后即可。
-#   取值留空时该键的值是 null，而 ConfigMap 与 Secret 的取值必须是字符串，
-#   因此校验命令会报 invalid type ... got "null", expected "string"，这是预期现象，填写完成之后该错误消失。
+# 阅读方式：下面每一个键的上面都用注释写出了取值与理由；本模板保留空值作为讲解占位，不能直接 apply。
+#   实际部署请使用顶层目录中已经填写完成的纯净版清单。
 #
 # 被引用位置：api-config 由 40-api.yaml 引用，postgres-secret 由 20-postgres.yaml 与 40-api.yaml 引用。
 #   引用方必须在被引用的键存在之后才能创建，因此本文件的编号前缀是 10，排在 20 与 40 之前。

@@ -1,3 +1,13 @@
+# ---------------------------------------------------------------------------
+# 50-web.yaml · 前端（NodePort Service 与 Deployment）· 带注释的模板
+#
+# 本文件位于 templates/，用于解释顶层 50-web.yaml 中每个字段的用途。
+# kubectl apply -f code/shortener/k8s/ 不会递归应用 templates/，实际部署使用顶层纯净版。
+#
+# Deployment web 运行两个 nginx 前端副本，提供静态文件并把 API 请求代理到 Service api；
+# NodePort Service 将集群端口 80 暴露到节点端口 30080。
+# 创建顺序依赖 40-api.yaml 中的 api Service。
+# ---------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
@@ -8,11 +18,13 @@ metadata:
 spec:
   type: NodePort
   selector:
+    # 必须与 Deployment 的 Pod 标签完全一致，否则该 Service 没有 Endpoints。
     app: web
   ports:
     - name: http
       port: 80
       targetPort: 80
+      # 固定端口便于本地访问；必须位于默认 NodePort 范围 30000-32767。
       nodePort: 30080
 ---
 apiVersion: apps/v1
@@ -34,11 +46,13 @@ spec:
     spec:
       containers:
         - name: web
+          # 镜像由 web/Dockerfile 构建，标签与 README 中的 kind load 命令一致。
           image: shortener-web:dev
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 80
+          # 检查 nginx 能提供站点入口后才把 Pod 加入 web Service Endpoints。
           readinessProbe:
             httpGet:
               path: /

@@ -1,3 +1,13 @@
+# ---------------------------------------------------------------------------
+# 40-api.yaml · 后端（ClusterIP Service 与 Deployment）· 带注释的模板
+#
+# 本文件位于 templates/，用于解释顶层 40-api.yaml 中每个字段的用途。
+# kubectl apply -f code/shortener/k8s/ 不会递归应用 templates/，实际部署使用顶层纯净版。
+#
+# Service api 为 web/nginx.conf 中的 upstream api:8080 提供稳定入口；
+# Deployment api 运行两个无状态副本。DATABASE_URL 从 Secret 注入，其余可调参数从 ConfigMap 注入。
+# 创建顺序依赖 10-config、20-postgres 与 30-redis。
+# ---------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
@@ -6,8 +16,10 @@ metadata:
   labels:
     app.kubernetes.io/part-of: shortener
 spec:
+  # 后端只允许集群内访问，外部请求由 web/nginx 反向代理进入。
   type: ClusterIP
   selector:
+    # 必须匹配 Deployment Pod 标签；否则 web 会解析到 Service，但没有可用后端。
     app: api
   ports:
     - name: http
@@ -22,6 +34,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: shortener
 spec:
+  # API 不保存本地状态，可通过多个副本横向扩展。
   replicas: 2
   selector:
     matchLabels:
@@ -31,20 +44,24 @@ spec:
       labels:
         app: api
     spec:
+      # 必须大于 ConfigMap 中 SHUTDOWN_TIMEOUT=10s，留出优雅退出时间。
       terminationGracePeriodSeconds: 30
       containers:
         - name: api
+          # 必须与 README 中的本地构建和 kind 镜像加载标签一致。
           image: shortener-api:dev
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8080
           env:
+            # 连接串含数据库口令，必须由 Secret 注入，不要写在普通清单值中。
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: postgres-secret
                   key: DATABASE_URL
+            # 以下配置均为非敏感参数，由 api-config 提供。
             - name: REDIS_ADDR
               valueFrom:
                 configMapKeyRef:
@@ -70,6 +87,7 @@ spec:
                 configMapKeyRef:
                   name: api-config
                   key: GIN_MODE
+          # 就绪检查依赖 PostgreSQL 与 Redis；依赖故障时摘除流量但不重启进程。
           readinessProbe:
             httpGet:
               path: /api/readyz
@@ -78,6 +96,7 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
+          # 存活检查只确认 API 进程可响应，不检查外部依赖，避免依赖故障引发重启风暴。
           livenessProbe:
             httpGet:
               path: /api/healthz

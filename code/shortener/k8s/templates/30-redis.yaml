@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+# 30-redis.yaml · 缓存（ClusterIP Service 与 Deployment）· 带注释的模板
+#
+# 本文件位于 templates/，用于解释顶层 30-redis.yaml 中每个字段的用途。
+# kubectl apply -f code/shortener/k8s/ 不会递归应用 templates/，实际部署使用顶层纯净版。
+#
+# 本文件创建两个对象：
+#   Service    redis  为同命名空间内的 API Pod 提供稳定的 redis:6379 地址
+#   Deployment redis  运行一个 Redis 实例；缓存丢失时数据可从 PostgreSQL 重建
+#
+# 与 compose.yaml 对应：services.redis 使用 redis:7-alpine，command 开启 AOF，
+# healthcheck 执行 redis-cli ping。这里用 readinessProbe 控制 Redis 是否接收流量。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: shortener
+  labels:
+    app.kubernetes.io/part-of: shortener
+spec:
+  # 缓存只供集群内部访问，不需要分配 NodePort。
+  type: ClusterIP
+  selector:
+    # 必须与 Deployment 的 Pod 标签完全一致，否则 Service 没有 Endpoints。
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: shortener
+  labels:
+    app.kubernetes.io/part-of: shortener
+spec:
+  # 单副本避免多个无共享状态的实例造成缓存键不一致。
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          # 复现 Compose 配置：启用 AOF，使 Redis 容器重启后仍保留缓存键。
+          args: ["redis-server", "--appendonly", "yes"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          # 只有 Redis 能响应 PING 并返回 PONG 时才将 Pod 加入 Service Endpoints。
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
