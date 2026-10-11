@@ -1,0 +1,45 @@
+Name:                   api
+Namespace:              shortener
+CreationTimestamp:      Wed, 07 Oct 2026 19:42:51 +0800
+Labels:                 app.kubernetes.io/part-of=shortener
+Annotations:            deployment.kubernetes.io/revision: 9
+Selector:               app=api
+Replicas:               2 desired | 2 updated | 2 total | 2 available | 0 unavailable
+StrategyType:           RollingUpdate
+MinReadySeconds:        0
+RollingUpdateStrategy:  25% max unavailable, 25% max surge
+Pod Template:
+  Labels:       app=api
+  Annotations:  kubectl.kubernetes.io/restartedAt: 2026-10-09T15:36:17+08:00
+  Containers:
+   api:
+    Image:      shortener-api:dev
+    Port:       8080/TCP (http)
+    Host Port:  0/TCP (http)
+    Limits:
+      cpu:     500m
+      memory:  256Mi
+    Requests:
+      cpu:      50m
+      memory:   64Mi
+    Liveness:   http-get http://:8080/api/healthz delay=10s timeout=3s period=10s #success=1 #failure=3
+    Readiness:  http-get http://:8080/api/readyz delay=5s timeout=3s period=5s #success=1 #failure=3
+    Environment:
+      DATABASE_URL:          <set to the key 'DATABASE_URL' in secret 'postgres-secret'>         Optional: false
+      REDIS_ADDR:            <set to the key 'REDIS_ADDR' of config map 'api-config'>            Optional: false
+      CACHE_TTL:             <set to the key 'CACHE_TTL' of config map 'api-config'>             Optional: false
+      CLICK_FLUSH_INTERVAL:  <set to the key 'CLICK_FLUSH_INTERVAL' of config map 'api-config'>  Optional: false
+      SHUTDOWN_TIMEOUT:      <set to the key 'SHUTDOWN_TIMEOUT' of config map 'api-config'>      Optional: false
+      GIN_MODE:              <set to the key 'GIN_MODE' of config map 'api-config'>              Optional: false
+    Mounts:                  <none>
+  Volumes:                   <none>
+  Node-Selectors:            <none>
+  Tolerations:               <none>
+Conditions:
+  Type           Status  Reason
+  ----           ------  ------
+  Progressing    True    NewReplicaSetAvailable
+  Available      True    MinimumReplicasAvailable
+OldReplicaSets:  api-57fdb44f7c (0/0 replicas created), api-794868694 (0/0 replicas created), api-78d6f5765f (0/0 replicas created), api-bff659fb5 (0/0 replicas created), api-74575d4f7b (0/0 replicas created), api-7fb4cb4f59 (0/0 replicas created)
+NewReplicaSet:   api-5f886d9b7b (2/2 replicas created)
+Events:          <none>

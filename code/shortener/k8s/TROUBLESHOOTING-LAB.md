@@ -2,6 +2,8 @@
 
 > 本手册是 [Kubernetes 部署指引](./README.md) 阶段 6 的配套实训文档。面向尚未独立完成 Kubernetes 故障演练的学习者，提供标准化的实验顺序、诊断命令、预期证据、恢复步骤与验收标准。
 
+> 已完成实验的复盘入口：[Kubernetes 故障排查思路总结](./doc/排障思路总结.md)。该总结将前四个实验串联为一套从用户症状到端到端恢复验收的诊断方法。
+
 ## 1. 整体框架
 
 本手册按照生产环境常见的事件响应流程组织，而非按命令类型组织：
@@ -284,30 +286,77 @@ kubectl set resources deploy/api -n shortener \
 kubectl rollout status deploy/api -n shortener --timeout=90s
 ```
 
-### B. CPU 节流（可选，需要产生请求负载）
+### B. CPU 节流与负载观察
 
-CPU limit 会限制容器可使用的 CPU 配额，通常导致节流而不是像内存 limit 一样直接终止进程。没有请求负载时，仅降低 CPU limit 不足以验证节流现象；单次请求延迟也不足以作为性能结论。
+CPU limit 会限制容器可使用的 CPU 配额，通常导致节流而不是像内存 limit 一样直接终止进程。没有持续请求负载时，仅降低 CPU limit 不足以验证节流；单次请求延迟也不足以作为性能结论。本实验使用 Metrics Server 观察实时 CPU，用 `hey` 产生固定时长的并发请求，并在相同请求强度下比较限额前后的吞吐量与延迟分布。
 
-将 API Deployment 的 CPU limit 临时调整为 `50m`，保持 request 为 `50m`，然后对 `/api/links?limit=100` 产生并发请求，并与基线配置下的多轮结果比较。该操作作用于整个 Deployment，并触发滚动更新。若本机没有 `hey` 或其他 HTTP 负载生成工具，可将本小节记录为“环境限制，未执行”，无需为完成阶段安装工具。若集群已部署 Metrics Server，可使用 `kubectl top pod -n shortener` 观察 CPU 使用量；未部署时应记录该指标不可用。
+#### 准备监控与负载工具
+
+以下 Metrics Server 安装步骤用于本地 kind 实验集群。官方清单启用组件及 RBAC；kind 节点 kubelet 使用的证书未由 Metrics Server 信任，因此仅在这个隔离的实验集群中为其添加 `--kubelet-insecure-tls`。生产集群应使用受信任的 kubelet 证书，不要照搬此 TLS 设置。
+
+先在宿主机拉取镜像，并将 kind 节点所需的 amd64 镜像归档后导入，避免节点无法访问镜像仓库时卡在 `ImagePullBackOff`：
+
+```bash
+docker pull registry.k8s.io/metrics-server/metrics-server:v0.8.0
+docker image save --platform linux/amd64 \
+  -o /tmp/metrics-server-v0.8.0-amd64.tar \
+  registry.k8s.io/metrics-server/metrics-server:v0.8.0
+kind load image-archive /tmp/metrics-server-v0.8.0-amd64.tar --name shortener
+rm /tmp/metrics-server-v0.8.0-amd64.tar
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.8.0/components.yaml
+kubectl patch deployment metrics-server -n kube-system --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl rollout status deployment/metrics-server -n kube-system --timeout=120s
+kubectl top nodes
+```
+
+`kubectl top nodes` 能返回 CPU 与内存用量即表示 Metrics API 已就绪。Metrics Server 是短期采样数据源，不提供历史时序存储；本实验的压测摘要用于比较请求结果。
+
+在运行 `hey` 的 Linux/WSL 环境中安装固定版本，并确认命令可用：
+
+```bash
+GOPROXY=https://goproxy.cn,direct go install github.com/rakyll/hey@v0.1.4
+"$(go env GOPATH)/bin/hey" -n 1 -c 1 'http://localhost:8080/api/healthz'
+```
+
+先确认前置检查中的 `kubectl port-forward -n shortener svc/web 8080:80` 会话仍在运行，再执行上面的单请求检查。如果 `hey` 已在 `PATH` 中，可直接写 `hey`；否则使用 `"$(go env GOPATH)/bin/hey"`。API Service 已将请求分发到两个 Ready 副本；本实验不创建 HPA，因为自动扩容会改变副本数，干扰对 CPU limit 的单变量比较。
+
+#### 建立基线并施加 CPU 限额
+
+先确认 Service 后面有两个 Ready API 地址，记录基线资源和 Pod 的 CPU 用量。在一个终端运行压测，另一个终端于压测期间执行 `kubectl top`；等待 Metrics Server 采样后再记录结果。
+
+```bash
+kubectl get endpointslices -n shortener -l kubernetes.io/service-name=api
+kubectl get deploy api -n shortener -o jsonpath='{.spec.template.spec.containers[0].resources}{"\n"}'
+kubectl top pod -n shortener -l app=api --containers
+hey -z 60s -c 10 'http://localhost:8080/api/links?limit=100'
+```
+
+将 API Deployment 的 CPU limit 临时调整为 `50m`，request 保持 `50m`。此变更作用于整个 Deployment，并会触发滚动更新；等待 rollout 完成后，以相同的 `hey` 参数重复压测和采样。
 
 ```bash
 kubectl set resources deploy/api -n shortener \
   --requests=cpu=50m,memory=64Mi \
   --limits=cpu=50m,memory=256Mi
 kubectl rollout status deploy/api -n shortener --timeout=90s
-hey -n 300 -c 10 'http://localhost:8080/api/links?limit=100'
+kubectl get endpointslices -n shortener -l kubernetes.io/service-name=api
+kubectl top pod -n shortener -l app=api --containers
+hey -z 60s -c 10 'http://localhost:8080/api/links?limit=100'
 ```
 
-验证重点：Pod 通常仍保持 Ready，CPU 限制本身不应导致重启；负载下应比较多轮请求的吞吐量与延迟分布。完成后将 API 资源恢复至基线并等待 rollout 完成。本实验用于说明 CPU 配额机制，不构成容量评估或性能基准。
+比较两轮结果的请求数/吞吐量、平均延迟、`50%`/`95%`/`99%` 延迟，以及负载期间各 API Pod 的 CPU。Pod 通常仍保持 Ready，CPU 限制本身不应导致重启。若 `kubectl top` 暂时报告没有可用指标，等待一个采样周期后重试，并检查 Metrics Server rollout 与日志；不要把指标缺失记成 CPU 使用量为零。
+
+完成后恢复清单中的资源基线，并确认两个副本均 Ready：
 
 ```bash
 kubectl set resources deploy/api -n shortener \
   --requests=cpu=50m,memory=64Mi \
   --limits=cpu=500m,memory=256Mi
 kubectl rollout status deploy/api -n shortener --timeout=90s
+kubectl get pods -n shortener -l app=api
 ```
 
-**机制要点：**OOM 是内存上限触发的容器终止；CPU limit 通常造成 CPU 节流。两者的状态表现、诊断证据和缓解措施不同。
+**机制要点：**OOM 是内存上限触发的容器终止；CPU limit 通常造成 CPU 节流。Service 将流量分发给 Ready API 副本，Metrics Server 提供实时资源采样；这些信号分别说明副本状态、集群内负载分布与容器资源用量，不应相互替代。本实验用于说明 CPU 配额机制，不构成容量评估或性能基准。
 
 ## 10. 实验六：liveness probe 对依赖故障的错误耦合
 
@@ -456,7 +505,7 @@ curl -i http://localhost:8080/api/readyz
 
 阶段 6 完成标准：
 
-- 完成第 5 至第 11 节的七项故障实验。若缺少负载生成工具，可将 CPU 节流实验记录为“环境限制，未执行”，并说明原因。
+- 完成第 5 至第 11 节的七项故障实验，包括 CPU 节流的基线/限额对照，并记录 Metrics Server 采样与 `hey` 压测摘要。
 - 完成一次限时综合诊断，得分不低于 8/10。
 - 能解释 readiness probe、liveness probe、Service/EndpointSlice、ConfigMap 环境变量更新机制、OOM 与 CPU 节流、Deployment 滚动更新及 SIGTERM 收尾。
 - 每项实验均包含真实观测证据、明确恢复操作及恢复验收结果。命令执行成功或 Pod 处于 Running 均不能单独作为完成依据。

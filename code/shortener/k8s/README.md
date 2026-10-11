@@ -23,7 +23,7 @@
 |---|---|---|---|---|
 | 1 | Docker 引擎可用 | `docker ps` | 输出表头 `CONTAINER ID IMAGE ...`，并且能够列出正在运行的容器 | 在 Windows 侧启动 Docker Desktop，并且在 Settings → Resources → WSL Integration 中打开当前发行版的开关；随后重新执行 `docker ps`。当前的失败形态是输出 `The command 'docker' could not be found in this WSL 2 distro.`，这条消息说明 WSL 集成没有生效，而不是说明本机没有安装 Docker |
 | 2 | kind 可用 | `kind version` | 输出版本号，本机当前是 `v0.33.0` | 本机的 kind 位于 `/home/drow/go/bin/kind`，确认 `$PATH` 中包含 `/home/drow/go/bin` |
-| 3 | kubectl 可用 | `kubectl version --client` | 输出客户端版本号 | 本机当前缺失，按第 0.3 节安装 |
+| 3 | kubectl 可用 | `kubectl version --client` | 输出客户端版本号 | 命令缺失时按第 0.3 节安装 |
 | 4 | 集群是否已经存在 | `kind get clusters` | 输出 `shortener` | 集群不存在时按第 0.4 节创建 |
 
 ### 0.3 安装 kubectl（本机当前缺失）
@@ -395,7 +395,9 @@ nodes:
 阶段 6 已从部署参考中拆出，作为独立实操文档维护：
 [阶段 6：故障排查与事故演练手册](./TROUBLESHOOTING-LAB.md)。
 
-手册按照事件响应流程组织：实验准备 → 影响评估 → 分层诊断 → 单一故障注入 → 证据分析 → 服务恢复与验收 → 技术复盘及限时综合诊断。内容包括七项可逆实验、CPU 节流可选练习、限时综合诊断、逐步操作命令和实验记录模板。首次执行应依照实验顺序完成，并通过每项实验的基线检查与恢复验收。
+手册按照事件响应流程组织：实验准备 → 影响评估 → 分层诊断 → 单一故障注入 → 证据分析 → 服务恢复与验收 → 技术复盘及限时综合诊断。内容包括七项可逆实验、CPU 节流与负载观察、限时综合诊断、逐步操作命令和实验记录模板。CPU 节流实验使用 Metrics Server 与 `hey` 比较资源用量和请求表现；首次执行前按手册配置实验工具，并通过每项实验的基线检查与恢复验收。
+
+前四项实验的面试复盘与统一排障框架见[《Kubernetes 故障排查思路总结》](./doc/排障思路总结.md)。
 
 ## 10. 常见错误对照表
 
