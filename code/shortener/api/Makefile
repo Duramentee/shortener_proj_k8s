@@ -47,8 +47,8 @@ fmt-check: ## 检查格式，列出需要重排的文件，全部合规时不输
 test: ## 运行全部包的测试，需要依赖的两组在缺少环境变量时会被跳过
 	$(GO) test ./...
 
-test-unit: ## 只运行不需要外部依赖的两组测试，也就是短码生成与路由
-	$(GO) test ./internal/shortcode/... ./internal/httpapi/... -v
+test-unit: ## 运行不需要外部依赖的短码、HTTP 与写回器单元测试
+	$(GO) test ./internal/shortcode/... ./internal/httpapi/... ./internal/flusher/... -v
 
 test-store: ## 运行需要真实 PostgreSQL 的存储层测试
 	TEST_DATABASE_URL='$(TEST_DATABASE_URL)' $(GO) test ./internal/store/... -v

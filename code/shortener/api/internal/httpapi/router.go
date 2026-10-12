@@ -9,27 +9,52 @@
 package httpapi
 
 import (
+	"context"
 	"log/slog"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
-	"shortener/internal/cache"
 	"shortener/internal/config"
 	"shortener/internal/store"
 )
+
+// LinkStore 是 HTTP 层需要的持久化能力。
+// 接口由消费者定义，生产环境由 store.Postgres 实现，测试中可注入内存替身。
+type LinkStore interface {
+	Ping(context.Context) error
+	CreateLink(context.Context, store.Link) error
+	GetLink(context.Context, string) (store.Link, error)
+	ListLinks(context.Context, int, int) ([]store.Link, error)
+	CountLinks(context.Context) (int64, error)
+	SumClicks(context.Context) (int64, error)
+	DeleteLink(context.Context, string) error
+}
+
+// LinkCache 是 HTTP 层需要的缓存能力。
+// 生产环境由 cache.Redis 实现，测试中可注入内存替身。
+type LinkCache interface {
+	Ping(context.Context) error
+	GetURL(context.Context, string) (string, error)
+	SetURL(context.Context, string, string, time.Duration) error
+	DeleteLink(context.Context, string) error
+	IncrClick(context.Context, string) error
+	RecordCacheResult(context.Context, bool) error
+	CacheStats(context.Context) (int64, int64, error)
+}
 
 // Server 持有处理请求所需的全部依赖。
 // 依赖通过结构体字段注入而不是包级变量，好处是构造过程是显式的，
 // 并且同一个进程内可以构造出多个互相独立的实例用于测试。
 type Server struct {
 	cfg    config.Config
-	store  *store.Postgres
-	cache  *cache.Redis
+	store  LinkStore
+	cache  LinkCache
 	logger *slog.Logger
 }
 
 // New 构造 Server。
-func New(cfg config.Config, pg *store.Postgres, rdb *cache.Redis, logger *slog.Logger) *Server {
+func New(cfg config.Config, pg LinkStore, rdb LinkCache, logger *slog.Logger) *Server {
 	return &Server{
 		cfg:    cfg,
 		store:  pg,

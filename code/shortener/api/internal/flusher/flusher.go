@@ -11,20 +11,32 @@ import (
 	"log/slog"
 	"time"
 
-	"shortener/internal/cache"
 	"shortener/internal/store"
 )
 
+// ClickCache 是写回器需要的缓存能力。
+// 由 cache.Redis 在生产环境实现，也可由测试替身实现。
+type ClickCache interface {
+	CollectClicks(context.Context) (map[string]int64, error)
+	SubtractClicks(context.Context, string, int64) error
+}
+
+// ClickStore 是写回器需要的持久化能力。
+// 由 store.Postgres 在生产环境实现，也可由测试替身实现。
+type ClickStore interface {
+	AddClicks(context.Context, string, int64) error
+}
+
 // Flusher 持有写回所需的依赖。
 type Flusher struct {
-	cache    *cache.Redis
-	store    *store.Postgres
+	cache    ClickCache
+	store    ClickStore
 	interval time.Duration
 	logger   *slog.Logger
 }
 
 // New 构造 Flusher。
-func New(rdb *cache.Redis, pg *store.Postgres, interval time.Duration, logger *slog.Logger) *Flusher {
+func New(rdb ClickCache, pg ClickStore, interval time.Duration, logger *slog.Logger) *Flusher {
 	return &Flusher{
 		cache:    rdb,
 		store:    pg,

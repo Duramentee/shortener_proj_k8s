@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -8,10 +9,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"shortener/internal/config"
+	"shortener/internal/store"
 )
 
 // 本文件是路由层的测试，它不需要 PostgreSQL 与 Redis，因此不需要任何环境变量就能运行。
@@ -28,17 +31,18 @@ func init() {
 }
 
 // newTestEngine 构造一个只用于测试的引擎。
-//
-// 传入 nil 作为 store 与 cache 是安全的，因为本文件测试的路由与存活检查都不会访问这两个依赖。
-// 这样构造还有一个额外的好处：一旦某个测试意外触发了需要依赖的处理函数，
-// 空指针会让测试立刻失败，而不是产生一个看似通过的假象。
 func newTestEngine(t *testing.T) *gin.Engine {
 	t.Helper()
 
 	// 日志写到一个丢弃器里，避免测试输出被请求日志淹没。
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	return New(config.Config{}, nil, nil, logger).Routes()
+	return newTestEngineWithDependencies(t, &mockStore{}, &mockCache{}, logger)
+}
+
+func newTestEngineWithDependencies(t *testing.T, pg LinkStore, rdb LinkCache, logger *slog.Logger) *gin.Engine {
+	t.Helper()
+	return New(config.Config{}, pg, rdb, logger).Routes()
 }
 
 // doRequest 向引擎发送一次不带请求体的请求，并且返回记录下来的响应。
@@ -77,11 +81,8 @@ func TestRoutesRegisterWithoutConflict(t *testing.T) {
 
 // TestRouteMatching 逐条检查请求实际命中的路由与返回的状态码。
 //
-// 表中依赖 PostgreSQL 与 Redis 的用例期望取值是 500，原因有两个：
-// 第一，newTestEngine 传入的 store 与 cache 都是 nil，处理函数一旦访问它们就会发生空指针解引用；
-// 第二，恢复中间件把这个 panic 转换成 500 响应。
-// 这两点合起来说明：请求确实命中了预期的处理函数，同时恢复中间件也生效了。
-// 需要检查真实状态码的场景由 TASKS.md 第 10 节的全量验收覆盖，那里使用真实的依赖服务。
+// 依赖服务由可控测试替身提供，因此本测试验证处理函数对依赖错误的正常响应，
+// 而不是依靠 nil 指针触发 panic 后得到一个偶然的 500。
 func TestRouteMatching(t *testing.T) {
 	engine := newTestEngine(t)
 
@@ -93,11 +94,11 @@ func TestRouteMatching(t *testing.T) {
 		wantStatus int
 	}{
 		{"存活检查", http.MethodGet, "/api/healthz", "", http.StatusOK},
-		{"就绪检查命中处理函数，空依赖由恢复中间件转换成 500", http.MethodGet, "/api/readyz", "", http.StatusInternalServerError},
+		{"就绪检查报告依赖不可用", http.MethodGet, "/api/readyz", "", http.StatusServiceUnavailable},
 		{"创建接口在请求体不是合法 JSON 时返回 400，不访问依赖", http.MethodPost, "/api/links", "not-json", http.StatusBadRequest},
-		{"列表接口命中处理函数，空依赖由恢复中间件转换成 500", http.MethodGet, "/api/links", "", http.StatusInternalServerError},
-		{"统计接口命中处理函数，空依赖由恢复中间件转换成 500", http.MethodGet, "/api/stats", "", http.StatusInternalServerError},
-		{"六位短码命中跳转处理函数，空依赖由恢复中间件转换成 500", http.MethodGet, "/a1B2c3", "", http.StatusInternalServerError},
+		{"列表接口报告存储依赖不可用", http.MethodGet, "/api/links", "", http.StatusServiceUnavailable},
+		{"统计接口报告存储依赖不可用", http.MethodGet, "/api/stats", "", http.StatusServiceUnavailable},
+		{"短码跳转报告缓存依赖不可用", http.MethodGet, "/a1B2c3", "", http.StatusServiceUnavailable},
 		{"格式不符合短码规则的路径返回 404，不访问依赖", http.MethodGet, "/favicon.ico", "", http.StatusNotFound},
 		{"路径匹配但方法不匹配时返回 405", http.MethodGet, "/api/links/xyz", "", http.StatusMethodNotAllowed},
 		{"存活检查不接受 POST 方法", http.MethodPost, "/api/healthz", "", http.StatusMethodNotAllowed},
@@ -186,6 +187,75 @@ func TestCreateLinkValidatesURL(t *testing.T) {
 
 			assertErrorMessage(t, recorder.Body.Bytes(), testCase.want)
 		})
+	}
+}
+
+func TestCreateLinkWithMockedDependencies(t *testing.T) {
+	var saved store.Link
+	now := time.Now().UTC()
+	pg := &mockStore{
+		create: func(_ context.Context, link store.Link) error {
+			saved = link
+			return nil
+		},
+		get: func(_ context.Context, code string) (store.Link, error) {
+			if code != saved.Code {
+				t.Fatalf("回读短码是 %q，期望 %q", code, saved.Code)
+			}
+			saved.CreatedAt = now
+			return saved, nil
+		},
+	}
+	rdb := &mockCache{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	engine := newTestEngineWithDependencies(t, pg, rdb, logger)
+
+	recorder := doRequestWithBody(engine, http.MethodPost, "/api/links", `{"url":"https://example.com/mock"}`)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("创建接口返回状态码 %d，期望 %d，响应体：%s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+	if saved.URL != "https://example.com/mock" || saved.Code == "" {
+		t.Fatalf("注入的存储替身收到的记录不符合预期：%+v", saved)
+	}
+	if !strings.Contains(recorder.Body.String(), saved.Code) {
+		t.Fatalf("成功响应没有包含替身保存的短码 %q：%s", saved.Code, recorder.Body.String())
+	}
+}
+
+func TestRedirectUsesMockedCache(t *testing.T) {
+	const code = "a1B2c3"
+	const target = "https://example.com/redirected"
+	var recordedHit, counted bool
+
+	pg := &mockStore{}
+	rdb := &mockCache{
+		getURL: func(_ context.Context, gotCode string) (string, error) {
+			if gotCode != code {
+				t.Fatalf("缓存查询短码是 %q，期望 %q", gotCode, code)
+			}
+			return target, nil
+		},
+		record: func(_ context.Context, hit bool) error {
+			recordedHit = hit
+			return nil
+		},
+		incrClick: func(_ context.Context, gotCode string) error {
+			counted = gotCode == code
+			return nil
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	engine := newTestEngineWithDependencies(t, pg, rdb, logger)
+
+	recorder := doRequest(engine, http.MethodGet, "/"+code)
+	if recorder.Code != http.StatusFound {
+		t.Fatalf("跳转接口返回状态码 %d，期望 %d", recorder.Code, http.StatusFound)
+	}
+	if location := recorder.Header().Get("Location"); location != target {
+		t.Fatalf("跳转目标是 %q，期望 %q", location, target)
+	}
+	if !recordedHit || !counted {
+		t.Fatalf("缓存命中统计或点击增量未调用：recordedHit=%t counted=%t", recordedHit, counted)
 	}
 }
 
