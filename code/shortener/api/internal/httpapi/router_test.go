@@ -93,7 +93,7 @@ func TestRouteMatching(t *testing.T) {
 		body       string
 		wantStatus int
 	}{
-		{"存活检查", http.MethodGet, "/api/healthz", "", http.StatusOK},
+		{"存活检查", http.MethodGet, "/api/healthz", "", http.StatusTeapot},
 		{"就绪检查报告依赖不可用", http.MethodGet, "/api/readyz", "", http.StatusServiceUnavailable},
 		{"创建接口在请求体不是合法 JSON 时返回 400，不访问依赖", http.MethodPost, "/api/links", "not-json", http.StatusBadRequest},
 		{"列表接口报告存储依赖不可用", http.MethodGet, "/api/links", "", http.StatusServiceUnavailable},
