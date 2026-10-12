@@ -1,0 +1,150 @@
+# 本文件是短链项目的持续集成（Continuous Integration）工作流定义。
+#
+# 它回答的问题是「这次提交能不能与主分支集成」，因此它只做验证，不构建镜像，也不部署。
+# 镜像构建与推送放在后续的独立工作流中，这样拉取请求阶段的检查就不需要任何软件包写入权限。
+#
+# 文件位置固定为仓库根目录下的 .github/workflows/ 目录，GitHub 只扫描这一个目录，
+# 放在其它目录中的 YAML 文件不会被识别为工作流。
+
+# name 是工作流的名称，它会显示在仓库 Actions 页面以及拉取请求的检查列表中。
+name: CI
+
+# on 段声明触发条件。这里只声明三种意图明确的触发方式，不监听其它事件。
+#
+# 事件选择的判定依据是「谁在什么时候需要这份结果」：
+#   pull_request 对应「开发者提交变更后需要快速反馈」；
+#   push 到 main 对应「变更已合并、需要确认主分支自身可构建」；
+#   workflow_dispatch 对应「需要人工重跑一次以复现问题」。
+on:
+  # 当有人向 main 分支发起拉取请求时触发。这是给开发者提供快速反馈的主要入口。
+  pull_request:
+    branches: [main]
+  # 当提交被合并进 main 分支之后再次触发，用来确认主分支自身处于可构建状态。
+  push:
+    branches: [main]
+  # 允许在 Actions 页面手动触发一次运行，用来自查或者复现问题。
+  # 需要特别记住：手动触发的按钮只有在默认分支上已经存在这个文件之后才会出现。
+  workflow_dispatch:
+
+# permissions 段显式声明这个工作流需要哪些权限。
+#
+# 每一次工作流运行都会自动获得一个临时的 GITHUB_TOKEN，如果不显式声明，
+# 它就会继承仓库设置中的默认权限，而那些默认权限可能包含写入权限。
+# 这里只申请读取仓库内容，因此即使这个工作流执行了不可信的代码，
+# 它也无法改写仓库内容，更无法发布软件包（发布软件包需要 packages: write）。
+# 后续的镜像发布工作流会单独申请 packages: write，两个工作流的权限互相隔离。
+permissions:
+  contents: read
+
+# concurrency 段控制同一个分支上同时运行的次数。
+#
+# group 是分组名称，同一个分组内只保留最新的一次运行。
+# cancel-in-progress 取值为 true 时，新的提交到达之后会取消同一分组中还在运行的旧运行。
+# 这样做的目的是避免为已经被取代的提交继续占用执行器时间，并且让新提交更快得到结果。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 第一个作业：后端检查。
+  # 作业之间默认并行执行，因此这一个作业与下面的 frontend 作业会同时开始。
+  # 两个作业分开的原因是它们的技术栈与依赖完全不同，分开之后可以独立失败、独立重跑，
+  # 并且在检查列表里各自显示结果，阅读者不需要翻日志就能看出是哪一侧失败。
+  backend:
+    # 作业名称会显示在拉取请求的检查列表中，写清技术栈便于直接阅读。
+    name: Backend (Go)
+    # runs-on 决定这个作业落在哪一台执行器上，这里使用 GitHub 托管的 Ubuntu 执行器。
+    # 使用托管执行器的原因是它每次都是一个干净的新环境，不需要处理持久化带来的状态残留。
+    runs-on: ubuntu-latest
+    # defaults.run.working-directory 让这个作业里所有 run 步骤默认在该目录下执行，
+    # 因此不需要在每条命令前面重复写 cd。
+    # 需要记住它的边界：它只影响 run 步骤，不影响 uses 步骤，
+    # 所以下面 setup-go 里的路径仍然必须写成相对于仓库根目录的完整路径。
+    defaults:
+      run:
+        working-directory: code/shortener/api
+    steps:
+      # 执行器启动时并不会自动获得仓库内容，必须由这一步显式把源码取下来。
+      # 这也是为什么几乎所有工作流的第一步都是 checkout：它不是一个隐式行为。
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 安装 Go 工具链并且打开模块缓存。
+      #
+      # go-version-file 指向 go.mod 文件，因此 Go 的版本由 go.mod 中 go 指令的那一行决定，
+      # 不需要在这里再写一个版本号，避免两处版本取值不一致。
+      # cache-dependency-path 指向 go.sum，缓存键由它的内容哈希决定；
+      # 只有当依赖清单发生变化时才会重新下载依赖，依赖未变化时直接复用缓存。
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: code/shortener/api/go.mod
+          cache-dependency-path: code/shortener/api/go.sum
+
+      # 格式检查：gofmt -l . 会列出所有未按官方格式排版的文件，全部合规时不输出任何内容。
+      # 因此这里用「输出是否为空」作为判定条件：输出非空时打印文件名并且以退出码 1 结束，
+      # 使这一步失败，从而让整个作业失败。
+      # 这一步必须放在编译与测试之前，因为它的执行成本最低，能够最快给出反馈。
+      - name: Check formatting (gofmt)
+        run: |
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "以下文件未通过格式检查，请先在本机执行 gofmt -w . 再提交："
+            echo "$files"
+            exit 1
+          fi
+          echo "格式检查通过"
+
+      # 编译全部包。这一步只检查语法与类型，不产生需要保存的输出文件。
+      - name: Build
+        run: go build ./...
+
+      # 静态检查。它可以发现格式化字符串的参数个数不匹配这类编译器不会报错的问题。
+      - name: Vet
+        run: go vet ./...
+
+      # 运行不依赖外部服务的单元测试。
+      #
+      # 这里只包含 shortcode、httpapi、flusher 三个包，它们不需要 PostgreSQL 与 Redis。
+      # 需要真实数据库的 store 包与需要真实缓存的 cache 包本次不纳入：
+      # 托管执行器上默认没有这两个服务，直接把它们写进来只会得到「跳过」而不是「通过」，
+      # 而把「跳过」当成「通过」会让检查结果失去意义。
+      # 是否把这两个包纳入以及如何纳入，留到 10-14 单独决定。
+      - name: Unit tests (no external dependencies)
+        run: go test ./internal/shortcode/... ./internal/httpapi/... ./internal/flusher/... -v
+
+  # 第二个作业：前端检查。
+  frontend:
+    name: Frontend (Vue + Vite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: code/shortener/web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 安装 Node 并且打开 npm 缓存。
+      #
+      # node-version 写成 22 而不是 latest，是为了与 web/Dockerfile 第一阶段使用的
+      # node:22-alpine 保持同一个主版本；如果两处版本不同，
+      # 就可能出现「镜像构建成功但持续集成失败」或者相反的情况，而这类问题排查成本很高。
+      # cache 取值为 npm 时，缓存键由 cache-dependency-path 指向的锁文件内容决定。
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: code/shortener/web/package-lock.json
+
+      # npm ci 严格按 package-lock.json 安装依赖，安装结果与锁文件完全一致；
+      # 当 package.json 与锁文件不一致时它会直接失败，而不是安静地装出一份与本地不同的依赖树。
+      # 这就是「可复现安装」的含义：同一份提交在任何机器上装出同一组依赖版本。
+      # 如果仓库里没有锁文件，这一步会报错，因此锁文件必须提交进版本库。
+      - name: Install dependencies (npm ci)
+        run: npm ci --no-audit --no-fund
+
+      # 生产构建。这一步验证 Vite 能完整产出 dist/ 目录，
+      # 使用的命令与 web/Dockerfile 第一阶段执行的命令保持一致。
+      - name: Production build
+        run: npm run build

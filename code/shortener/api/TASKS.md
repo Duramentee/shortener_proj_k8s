@@ -18,7 +18,7 @@
 | HTTP 框架（已选定） | HTTP 层使用 `github.com/gin-gonic/gin` v1.12.0。路由注册、路由分组、路径参数取值、JSON 响应写出、中间件链这五件事由框架承担 | 已经接入并且在 `go.mod` 中声明依赖，写法见 `GO-CHEATSHEET.md` 第 11 节与第 13 节 |
 | 基础设施（已写好） | 环境变量解析（`internal/config`）、PostgreSQL 连接池创建与建表（`internal/store`）、Redis 客户端创建与键名函数（`internal/cache`）、基于 gin 的路由注册与中间件挂载（`internal/httpapi/router.go`）、请求日志中间件与 panic 恢复中间件（`internal/httpapi/middleware.go`）、请求体解析与错误响应写出辅助函数（`internal/httpapi/handlers.go`）、`main` 的函数装配与优雅退出、`GET /api/healthz`、全部接口契约的响应结构体与转换函数 | 已写好，你不需要修改 |
 | 业务逻辑（由你实现） | 短码生成 1 个函数、存储层 7 个方法、缓存层 8 个方法、处理函数 6 个、后台写回 2 个方法，合计 24 个函数 | 已全部填写完成（第 4 组至第 8 组于 2026-09-30 完成），并且通过第 10 节的全量验收 |
-| 分层验证（已写好） | `internal/shortcode/shortcode_test.go`、`internal/store/postgres_test.go`、`internal/cache/redis_test.go`、`internal/httpapi/router_test.go` | 已写好，直接运行即可。前三个需要依赖服务或者环境变量，路由测试不需要任何依赖 |
+| 分层验证（已写好） | `internal/shortcode/shortcode_test.go`、`internal/store/postgres_test.go`、`internal/cache/redis_test.go`、`internal/httpapi/router_test.go`、`internal/flusher/flusher_test.go` | 已写好。存储层与缓存层测试是需要服务的适配器集成测试；HTTP 层与写回器通过接口注入替身，不需要 PostgreSQL 或 Redis |
 
 ### 0.2 未填写的函数在被调用时会怎样
 
@@ -66,7 +66,7 @@
 | `make fmt` | `gofmt -w .` | 一次修改了很多文件之后 |
 | `make fmt-check` | `gofmt -l .` | 提交之前确认格式 |
 | `make test` | `go test ./...` | 一组任务完成之后的整体确认 |
-| `make test-unit` | `go test ./internal/shortcode/... ./internal/httpapi/... -v` | 第 1 组的验收，不需要任何外部依赖 |
+| `make test-unit` | `go test ./internal/shortcode/... ./internal/httpapi/... ./internal/flusher/... -v` | 运行短码、HTTP 层和写回器单元测试，不需要任何外部依赖 |
 | `make test-store` | 带上 `TEST_DATABASE_URL` 运行存储层测试 | 第 2 组的验收 |
 | `make test-cache` | 带上 `TEST_REDIS_ADDR` 运行缓存层测试 | 第 3 组的验收 |
 | `make test-all` | 带上两个环境变量运行全部测试 | 八组全部完成之后的总体验收 |
@@ -86,6 +86,17 @@
 | 变量可以在命令行覆盖 | 例如 `make run HTTP_ADDR=:9090` 会用 9090 端口启动服务；`make test-store TEST_DATABASE_URL=另一个连接串` 会覆盖默认的连接串 |
 | `GOPROXY` 已经在文件内部设置 | Makefile 把它导出给每一条命令，因此使用 `make` 时不需要手动执行 `export GOPROXY`；但直接使用 `go` 命令时仍然需要设置它 |
 | 默认会先把实际执行的命令打印出来 | 这是 make 的默认行为，作用是让人看到这个目标到底执行了什么。执行 `make build` 时会先看到一行 `go build ./...` 再看到结果，两者之间的关系一目了然 |
+
+### 0.6 单元测试与适配器集成测试的边界
+
+HTTP 层在 `internal/httpapi/router.go` 定义 `LinkStore` 与 `LinkCache` 接口，写回器在
+`internal/flusher/flusher.go` 定义 `ClickStore` 与 `ClickCache` 接口。生产环境分别由
+`store.Postgres` 与 `cache.Redis` 实现这些接口；单元测试可注入内存替身，独立验证请求处理、
+错误分支以及“数据库写入成功后才扣除缓存增量”等业务规则。
+
+`internal/store/postgres_test.go` 与 `internal/cache/redis_test.go` 则有不同目的：它们验证真实 SQL、
+PostgreSQL 错误码、Redis 命令和键行为，所以仍属于适配器集成测试，需要真实 PostgreSQL/Redis。
+不能用内存 mock 的通过结果代替这些协议与数据库行为验证，也不能把没有配置服务时跳过的测试记为通过。
 
 ---
 
@@ -581,4 +592,3 @@ PostgreSQL 与 Redis 完全一致。需要覆盖默认值时，先执行 `cp .en
 需要写进笔记的机制共三条：第一，命中率的分母为 0 时必须返回 0，因为 `NaN` 不是合法的 JSON；
 第二，删除操作必须先动数据库再动缓存，反过来会让「数据库删除失败」表现为删除没有生效；
 第三，写回的扣除顺序决定了故障后果，先写数据库只会造成重复写回，先扣缓存会永久丢失计数。
-

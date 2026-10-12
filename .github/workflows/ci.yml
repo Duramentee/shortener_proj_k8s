@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: code/shortener/api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: code/shortener/api/go.mod
+          cache-dependency-path: code/shortener/api/go.sum
+
+      - name: Check formatting (gofmt)
+        run: |
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "以下文件未能通过格式检查, 请先在本机执行 gofmt -w . 之后再提交: "
+            echo "$files"
+            exit 1
+          fi
+          echo "格式检查通过"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests (no external dependencies)
+        run: go test ./internal/shortcode/... ./internal/httpapi/... ./internal/flusher/... -v
+
+  frontend:
+    name: Frontend (Vue + Vite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: code/shortener/web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: code/shortener/web/package-lock.json
+
+      - name: Install dependencies (npm ci)
+        run: npm ci --no-audit --no-fund
+
+      - name: Production build
+        run: npm run build
