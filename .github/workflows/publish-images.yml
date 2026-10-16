@@ -1,0 +1,56 @@
+name: PublishImage
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publishImages-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: ImagePublishing
+
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+
+    runs-on: ubuntu-latest
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_SHA: ${{ github.event.workflow_run.head_sha }}
+
+    steps:
+      - name: Checkout the exact commit that CI validated
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Compute lowercase image namespace
+        run: |
+          echo "IMAGE_NAMESPACE=${REGISTRY}/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push the API image
+        run: |
+          image="${IMAGE_NAMESPACE}/shortener-api:${IMAGE_SHA}"
+          docker build --file code/shortener/api/Dockerfile --tag "${image}" code/shortener/api
+          docker push "${image}"
+
+      - name: Build and push the Web image
+        run: |
+          image="${IMAGE_NAMESPACE}/shortener-web:${IMAGE_SHA}"
+          docker build --file code/shortener/web/Dockerfile --tag "${image}" code/shortener/web
+          docker push "${image}"
